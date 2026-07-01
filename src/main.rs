@@ -62,7 +62,7 @@ fn main() -> Result<()> {
 
     if cfg.microtest {
         let gpu = Gpu::new(instance.clone(), chosen[0].clone())?;
-        return microtest::run(gpu, 200_000);
+        return microtest::run(gpu, 1_000_000);
     }
 
     if cfg.selftest {

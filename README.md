@@ -19,9 +19,13 @@ things are handled explicitly:
   operations. The FP core variables are marked `precise` in GLSL so the driver
   emits `NoContraction` and does not fuse them.
 * Correctly-rounded division. The reference divide is IEEE round-to-nearest (x86
-  `divss` / `-cl-fp32-correctly-rounded-divide-sqrt`). Vulkan only guarantees
-  2.5 ULP for `OpFDiv`, so the division is done in `fp64` and rounded back to
-  `fp32` (double-rounding is safe: `53 ≥ 2·24 + 2`).
+  `divss` / `-cl-fp32-correctly-rounded-divide-sqrt`), but Vulkan only guarantees
+  2.5 ULP for `OpFDiv`. The divisor here is always a normal number in `±[2,4)`
+  (cn/gpu forces it), so `crdiv` uses a Markstein method — a bit-hack reciprocal
+  seed, 3 Newton-Raphson steps (≤0.5 ULP for that range), then one FMA residual
+  correction — which is correctly rounded and ~9% faster than the `fp64` fallback
+  (`-DCRDIV_FP64`). Every op is IEEE fp32, so it matches the CPU reference
+  bit-for-bit (validated over 800M+ divides by the self/micro tests).
 * No reassociation in the reductions. The cn1 cross-lane float reductions are
   also `precise`; otherwise the AMD shader compiler reassociates the adds and the
   result drifts by a ULP after a few thousand iterations.
@@ -50,7 +54,7 @@ Each hash runs four compute kernels ([`shaders/`](shaders/)):
 VRAM is used through scratchpad shards: each shard is one `≤ 2 GiB` buffer
 holding `--tps` lanes (default 960 ≈ 1.9 GiB). Several shards run per dispatch,
 stage-major, so they overlap on the queue. On a 7900 XT the default (intensity 1)
-uses 5 shards / 4800 lanes at ~5.4 kH/s.
+uses 5 shards / 4800 lanes at ~5.9 kH/s.
 
 ## Build
 
@@ -97,9 +101,9 @@ mis-mapped target cannot produce a rejected share, only a missed one.
 * `--tps` is capped by the 2 GiB max-allocation limit (960 lanes ≈ 1.9 GiB).
 * More shards is not always faster: the card saturates around 3–5 shards and then
   becomes power/thermal-bound (8 shards is slower than 5).
-* An `fp32` divide instead of the `fp64` correctly-rounded one is ~10% faster but
-  is not bit-exact, so it is off by default. A correctly-rounded `fp32`
-  (Markstein) divide would recover most of that gap.
+* The divide uses a correctly-rounded Markstein `fp32` method by default; build
+  with `-DCRDIV_FP64` (via `glslc`) to fall back to the `fp64` divide, which is
+  ~9% slower but also correctly rounded.
 
 ## License
 

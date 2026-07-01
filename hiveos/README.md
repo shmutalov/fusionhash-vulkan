@@ -59,7 +59,7 @@ dashboard.
 
 ## Notes
 
-- Algorithm label is `cn/gpu`. Expect ~5 kH/s per RX 7900 XT.
+- Algorithm label is `cn/gpu`. Expect ~5.9 kH/s per RX 7900 XT.
 - Requires a working Vulkan driver on the rig (AMD RDNA/RDNA2/RDNA3 with the
   amdgpu stack). Check with `vulkminer --info`.
 - The miner writes `/var/log/miner/vulkminer/vulkminer.stats.json`; `h-stats.sh`

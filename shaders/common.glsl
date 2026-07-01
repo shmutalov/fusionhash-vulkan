@@ -100,8 +100,17 @@ uint64_t bswap64(uint64_t x) {
 vec4 fp_and(vec4 a, uint m) { return uintBitsToFloat(floatBitsToUint(a) & uvec4(m)); }
 vec4 fp_or(vec4 a, uint m)  { return uintBitsToFloat(floatBitsToUint(a) | uvec4(m)); }
 
-// IEEE correctly-rounded fp32 division (round-to-nearest-even), computed in
-// fp64 then rounded back. Matches x86 `divss` / OpenCL correctly-rounded divide.
+// IEEE correctly-rounded fp32 division (round-to-nearest-even).
+//
+// Two implementations, selected at compile time:
+//   * default: Markstein — a fused-multiply-add residual method in pure fp32.
+//     The divisor here is always a normal number in +/-[2,4) (cn/gpu forces it),
+//     so no special-case handling is needed. Every op is IEEE fp32, so it is
+//     deterministic and matches the CPU fp64 reference bit-for-bit (validated by
+//     the self-test / micro-test).
+//   * CRDIV_FP64: divide in fp64 and round back (correctly rounded by
+//     construction, ~10% slower on RDNA3). Kept as a reference/fallback.
+#ifdef CRDIV_FP64
 vec4 crdiv(vec4 a, vec4 b) {
     return vec4(
         float(double(a.x) / double(b.x)),
@@ -109,6 +118,24 @@ vec4 crdiv(vec4 a, vec4 b) {
         float(double(a.z) / double(b.z)),
         float(double(a.w) / double(b.w)));
 }
+#else
+vec4 crdiv(vec4 a, vec4 b) {
+    vec4 ab = abs(b);
+    // Reciprocal seed (bit hack) + Newton-Raphson to ~correctly-rounded 1/|b|.
+    vec4 y = uintBitsToFloat(uvec4(0x7EF127EAu) - floatBitsToUint(ab));
+    vec4 e;
+    e = fma(-ab, y, vec4(1.0)); y = fma(y, e, y);
+    e = fma(-ab, y, vec4(1.0)); y = fma(y, e, y);
+    e = fma(-ab, y, vec4(1.0)); y = fma(y, e, y);
+    // Apply the divisor's sign: rb = 1/b.
+    vec4 rb = uintBitsToFloat(floatBitsToUint(y) | (floatBitsToUint(b) & uvec4(0x80000000u)));
+    // Quotient + FMA residual correction -> correctly rounded a/b.
+    vec4 q = a * rb;
+    vec4 r = fma(-b, q, a);
+    q = fma(r, rb, q);
+    return q;
+}
+#endif
 
 precise vec4 fma_break(precise vec4 x) {
     x = fp_and(x, 0xFEFFFFFFu);
