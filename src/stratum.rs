@@ -1,8 +1,11 @@
 //! Pool client. Two implementations:
 //!   * `MockPool`   — a synthetic job for benchmarking, no network.
-//!   * `StratumPool`— WebSocket JSON-RPC 2.0, CryptoNote-style login/job/submit
-//!                    (the usual shape for a cn/gpu coin). Field mapping lives
-//!                    in `parse_job`/`submit`; adjust there if a pool differs.
+//!   * `StratumPool`— the FusionLayer protocol: go-ethereum JSON-RPC 2.0 over
+//!                    WebSocket. Subscribe with `eth_subscribe("newWork", user,
+//!                    pass, agent)`; jobs arrive as `eth_subscription`
+//!                    notifications carrying a 6-string array
+//!                    `[jobId, powHash, seedHash, target, blockNumber,
+//!                    extraNonce]`; shares are sent with `eth_submitWork`.
 
 use anyhow::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,9 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tungstenite::Message;
 
+const AGENT: &str = "warpminer";
+
 pub struct Job {
     pub job_id: String,
-    pub input: Vec<u8>,
+    pub pow_hash: Vec<u8>, // 32 bytes
+    pub input: Vec<u8>,    // powHash(32) || seedHash(32) || 00*8  (72 bytes)
     pub target: u64,
     pub extra_nonce: u64,
     pub received: Instant,
@@ -21,19 +27,8 @@ pub struct Job {
 }
 
 impl Job {
-    pub fn new(job_id: String, input: Vec<u8>, target: u64, extra_nonce: u64) -> Self {
-        Self {
-            job_id,
-            input,
-            target,
-            extra_nonce,
-            received: Instant::now(),
-            nonce_cursor: AtomicU64::new(0),
-        }
-    }
-
     /// 128-byte input blob with the trailing 0x01 pad applied (matches the
-    /// upstream `setJob`).
+    /// upstream `setJob`: the pad lands at byte 72).
     pub fn input_128(&self) -> [u8; 128] {
         let mut b = [0u8; 128];
         let n = self.input.len().min(127);
@@ -67,11 +62,22 @@ pub struct MockPool {
 
 impl MockPool {
     pub fn new() -> Self {
-        let input: Vec<u8> = (0..76u16).map(|i| (i * 7 + 3) as u8).collect();
+        let mut input = vec![0u8; 72];
+        for (i, b) in input.iter_mut().take(64).enumerate() {
+            *b = (i * 7 + 3) as u8;
+        }
         Self {
             // target 0 -> effectively no shares, so benchmarking measures pure
             // pipeline throughput.
-            job: Arc::new(Job::new("mock".into(), input, 0, 0)),
+            job: Arc::new(Job {
+                job_id: "mock".into(),
+                pow_hash: input[..32].to_vec(),
+                input,
+                target: 0,
+                extra_nonce: 0,
+                received: Instant::now(),
+                nonce_cursor: AtomicU64::new(0),
+            }),
         }
     }
 }
@@ -90,12 +96,11 @@ impl Pool for MockPool {
 }
 
 // ---------------------------------------------------------------------------
-// Real stratum pool
+// Real pool (FusionLayer / go-ethereum RPC)
 // ---------------------------------------------------------------------------
 
 struct Shared {
     current: Mutex<Option<Arc<Job>>>,
-    session_id: Mutex<Option<String>>,
     req_id: AtomicU64,
 }
 
@@ -109,7 +114,6 @@ impl StratumPool {
     pub fn connect(url: &str, user: String, pass: String) -> Result<Self> {
         let shared = Arc::new(Shared {
             current: Mutex::new(None),
-            session_id: Mutex::new(None),
             req_id: AtomicU64::new(1),
         });
         let (tx, rx) = mpsc::channel::<String>();
@@ -133,22 +137,13 @@ impl Pool for StratumPool {
 
     fn submit(&self, job: &Arc<Job>, nonce: u64) {
         let id = self.shared.req_id.fetch_add(1, Ordering::Relaxed);
-        let sid = self
-            .shared
-            .session_id
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_default();
+        let nonce_hex = format!("0x{:016x}", nonce);
+        let pow_hex = format!("0x{}", hex::encode(&job.pow_hash));
         let msg = serde_json::json!({
-            "id": id,
             "jsonrpc": "2.0",
-            "method": "submit",
-            "params": {
-                "id": sid,
-                "job_id": job.job_id,
-                "nonce": format!("{:016x}", nonce),
-            }
+            "id": id,
+            "method": "eth_submitWork",
+            "params": [job.job_id, nonce_hex, pow_hex],
         })
         .to_string();
         let _ = self.tx.send(msg);
@@ -170,7 +165,9 @@ fn io_loop(url: String, user: String, pass: String, shared: Arc<Shared>, rx: Rec
     }
 }
 
-fn set_read_timeout(ws: &tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>) {
+fn set_read_timeout(
+    ws: &tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) {
     use tungstenite::stream::MaybeTlsStream;
     let dur = Some(Duration::from_millis(500));
     match ws.get_ref() {
@@ -195,19 +192,19 @@ fn run_connection(
     let (mut ws, _resp) = tungstenite::connect(url)?;
     set_read_timeout(&ws);
 
-    // login
+    // eth_subscribe("newWork", user, pass, agent)
     let id = shared.req_id.fetch_add(1, Ordering::Relaxed);
-    let login = serde_json::json!({
-        "id": id,
+    let sub = serde_json::json!({
         "jsonrpc": "2.0",
-        "method": "login",
-        "params": { "login": user, "pass": pass, "agent": "fusionhash-vulkan/0.1" }
+        "id": id,
+        "method": "eth_subscribe",
+        "params": ["newWork", user, pass, AGENT],
     })
     .to_string();
-    ws.send(Message::Text(login.into()))?;
+    ws.send(Message::Text(sub.into()))?;
+    log::info!("subscribed to newWork as {user}");
 
     loop {
-        // drain outgoing submits
         while let Ok(msg) = rx.try_recv() {
             ws.send(Message::Text(msg.into()))?;
         }
@@ -228,7 +225,7 @@ fn run_connection(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // idle tick; loop back to drain outgoing
+                // idle tick; loop back to drain outgoing submits
             }
             Err(e) => return Err(e.into()),
         }
@@ -244,89 +241,93 @@ fn handle_message(text: &str, shared: &Arc<Shared>) {
         }
     };
 
-    // session id from a login result
-    if let Some(sid) = v.get("result").and_then(|r| r.get("id")).and_then(|x| x.as_str()) {
-        *shared.session_id.lock().unwrap() = Some(sid.to_string());
-    }
-
-    // job either nested in a login result, or as a `job` notification
-    let job_val = v
-        .get("result")
-        .and_then(|r| r.get("job"))
-        .or_else(|| {
-            if v.get("method").and_then(|m| m.as_str()) == Some("job") {
-                v.get("params")
-            } else {
-                None
+    // Job notification: {"method":"eth_subscription","params":{"result":[..6..]}}
+    if v.get("method").and_then(|m| m.as_str()) == Some("eth_subscription") {
+        if let Some(arr) = v
+            .get("params")
+            .and_then(|p| p.get("result"))
+            .and_then(|r| r.as_array())
+        {
+            match parse_job(arr) {
+                Some(job) => {
+                    let diff = if job.target == 0 { 0 } else { u64::MAX / job.target + 1 };
+                    log::info!(
+                        "new job {} block={} diff={} target=0x{:016x} extraNonce=0x{:x}",
+                        job.job_id,
+                        job_block(arr),
+                        diff,
+                        job.target,
+                        job.extra_nonce,
+                    );
+                    *shared.current.lock().unwrap() = Some(Arc::new(job));
+                }
+                None => log::warn!("could not parse job: {text}"),
             }
-        });
-
-    if let Some(jv) = job_val {
-        match parse_job(jv) {
-            Some(job) => {
-                log::info!(
-                    "new job {} target=0x{:016x} extraNonce=0x{:x} ({} input bytes)",
-                    job.job_id,
-                    job.target,
-                    job.extra_nonce,
-                    job.input.len()
-                );
-                *shared.current.lock().unwrap() = Some(Arc::new(job));
-            }
-            None => log::warn!("could not parse job: {jv}"),
         }
         return;
     }
 
-    // submit acknowledgements / errors
+    // eth_submitWork ack / eth_subscribe confirmation / errors.
     if let Some(err) = v.get("error") {
         if !err.is_null() {
-            log::warn!("share rejected: {err}");
+            log::warn!("rpc error: {err}");
             return;
         }
     }
-    if v.get("result").is_some() && v.get("method").is_none() {
-        log::debug!("rpc result: {text}");
+    match v.get("result") {
+        Some(serde_json::Value::Bool(true)) => log::info!("share accepted"),
+        Some(serde_json::Value::Bool(false)) => log::warn!("share rejected"),
+        Some(serde_json::Value::String(s)) => log::debug!("subscription id {s}"),
+        _ => {}
     }
 }
 
-fn parse_num(v: &serde_json::Value) -> Option<u64> {
-    if let Some(n) = v.as_u64() {
-        return Some(n);
-    }
-    if let Some(s) = v.as_str() {
-        let s = s.trim_start_matches("0x");
-        if let Ok(n) = u64::from_str_radix(s, 16) {
-            return Some(n);
-        }
-    }
-    None
+fn job_block(arr: &[serde_json::Value]) -> u64 {
+    arr.get(4)
+        .and_then(|x| x.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0)
 }
 
-fn parse_job(jv: &serde_json::Value) -> Option<Job> {
-    let job_id = jv
-        .get("job_id")
-        .or_else(|| jv.get("jobId"))
-        .and_then(|x| x.as_str())?
-        .to_string();
+fn parse_job(arr: &[serde_json::Value]) -> Option<Job> {
+    if arr.len() < 6 {
+        return None;
+    }
+    let s = |i: usize| arr[i].as_str();
 
-    let blob_hex = jv
-        .get("blob")
-        .or_else(|| jv.get("input"))
-        .or_else(|| jv.get("header"))
-        .and_then(|x| x.as_str())?;
-    let input = hex::decode(blob_hex.trim_start_matches("0x")).ok()?;
+    let job_id = s(0)?.to_string();
+    let pow_hash = hex::decode(s(1)?.trim_start_matches("0x")).ok()?;
+    let seed_hash = hex::decode(s(2)?.trim_start_matches("0x")).ok()?;
+    if pow_hash.len() != 32 || seed_hash.len() != 32 {
+        return None;
+    }
 
-    let target = jv
-        .get("target")
-        .and_then(parse_num)
-        .unwrap_or(u64::MAX);
+    // target = top 64 bits of the 256-bit target hex.
+    let thex = s(3)?.trim_start_matches("0x");
+    let top16: String = thex.chars().take(16).collect();
+    let target = u64::from_str_radix(&top16, 16).ok()?;
 
-    let extra_nonce = jv
-        .get("extraNonce")
-        .or_else(|| jv.get("extra_nonce"))
-        .and_then(parse_num)
-        .unwrap_or(0);
+    // extraNonce = hex, left-justified into 64 bits.
+    let enh = s(5)?;
+    let extra_nonce = if enh.is_empty() {
+        0
+    } else {
+        u64::from_str_radix(&format!("{:0<16}", enh), 16).ok()?
+    };
 
-    Some(Job::new(job_id, input, target, extra_nonce))
+    // input = powHash || seedHash || 8 zero bytes (72 bytes)
+    let mut input = Vec::with_capacity(72);
+    input.extend_from_slice(&pow_hash);
+    input.extend_from_slice(&seed_hash);
+    input.extend_from_slice(&[0u8; 8]);
+
+    Some(Job {
+        job_id,
+        pow_hash,
+        input,
+        target,
+        extra_nonce,
+        received: Instant::now(),
+        nonce_cursor: AtomicU64::new(0),
+    })
 }
