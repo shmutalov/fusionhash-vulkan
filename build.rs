@@ -1,38 +1,53 @@
 //! Compiles the GLSL compute shaders to SPIR-V at build time using `glslc`
-//! (shipped with the Vulkan SDK). The resulting `.spv` blobs are written to
-//! `OUT_DIR` and pulled into the binary with `include_bytes!`.
+//! (from the Vulkan SDK). When `glslc` is not available (e.g. a minimal Linux
+//! rig or CI image), it falls back to the pre-built SPIR-V committed under
+//! `shaders/spirv/`, so the crate builds with nothing but a Rust toolchain.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADERS: &[&str] = &["cn0.comp", "cn00.comp", "cn1.comp", "cn2.comp", "sctest.comp"];
+// (source shader, output basename)
+const SHADERS: &[(&str, &str)] = &[
+    ("cn0.comp", "cn0.comp.spv"),
+    ("cn00.comp", "cn00.comp.spv"),
+    ("cn1.comp", "cn1.comp.spv"),
+    ("cn2.comp", "cn2.comp.spv"),
+    ("sctest.comp", "sctest.comp.spv"),
+];
+// cn2 debug variant (defines DEBUG_HASH)
+const CN2_DBG_OUT: &str = "cn2_dbg.comp.spv";
 
-fn find_glslc() -> PathBuf {
-    // Prefer the compiler that ships with the installed Vulkan SDK, fall back to PATH.
+fn find_glslc() -> Option<PathBuf> {
     if let Ok(sdk) = std::env::var("VULKAN_SDK") {
         let exe = if cfg!(windows) { "glslc.exe" } else { "glslc" };
-        let candidate = Path::new(&sdk).join("Bin").join(exe);
-        if candidate.exists() {
-            return candidate;
-        }
-        let candidate = Path::new(&sdk).join("bin").join(exe);
-        if candidate.exists() {
-            return candidate;
+        for sub in ["Bin", "bin"] {
+            let c = Path::new(&sdk).join(sub).join(exe);
+            if c.exists() {
+                return Some(c);
+            }
         }
     }
-    PathBuf::from("glslc")
+    // Is glslc on PATH?
+    let probe = if cfg!(windows) { "glslc.exe" } else { "glslc" };
+    if Command::new(probe).arg("--version").output().is_ok() {
+        return Some(PathBuf::from(probe));
+    }
+    None
 }
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let shader_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders");
-    let glslc = find_glslc();
+    let prebuilt_dir = shader_dir.join("spirv");
 
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
 
-    let compile = |src: &Path, dst: &Path, defines: &[&str]| {
-        let mut cmd = Command::new(&glslc);
+    let glslc = find_glslc();
+
+    let compile = |src: &Path, dst: &Path, defines: &[&str]| -> bool {
+        let Some(glslc) = &glslc else { return false };
+        let mut cmd = Command::new(glslc);
         cmd.arg("--target-env=vulkan1.3")
             .arg("-fshader-stage=compute")
             .arg("-O")
@@ -46,23 +61,33 @@ fn main() {
             .arg("-o")
             .arg(dst)
             .status()
-            .unwrap_or_else(|e| panic!("failed to launch glslc ({}): {e}", glslc.display()));
+            .unwrap_or_else(|e| panic!("failed to launch glslc: {e}"));
         if !status.success() {
             panic!("glslc failed to compile {}", src.display());
         }
+        true
     };
 
-    for shader in SHADERS {
-        let src = shader_dir.join(shader);
-        println!("cargo:rerun-if-changed={}", src.display());
-        compile(&src, &out_dir.join(format!("{shader}.spv")), &[]);
-    }
+    let use_prebuilt = |name: &str, dst: &Path| {
+        let src = prebuilt_dir.join(name);
+        if !src.exists() {
+            panic!(
+                "glslc not found and no pre-built SPIR-V at {} — install the \
+                 Vulkan SDK or commit shaders/spirv/{name}",
+                src.display()
+            );
+        }
+        std::fs::copy(&src, dst).expect("failed to copy pre-built SPIR-V");
+    };
 
-    // Debug variant of cn2 that also emits the per-lane PoW value, used by the
-    // GPU-vs-CPU self test.
-    compile(
-        &shader_dir.join("cn2.comp"),
-        &out_dir.join("cn2_dbg.comp.spv"),
-        &["DEBUG_HASH"],
-    );
+    for (src_name, out_name) in SHADERS {
+        let dst = out_dir.join(out_name);
+        if !compile(&shader_dir.join(src_name), &dst, &[]) {
+            use_prebuilt(out_name, &dst);
+        }
+    }
+    let dbg_dst = out_dir.join(CN2_DBG_OUT);
+    if !compile(&shader_dir.join("cn2.comp"), &dbg_dst, &["DEBUG_HASH"]) {
+        use_prebuilt(CN2_DBG_OUT, &dbg_dst);
+    }
 }

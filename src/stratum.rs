@@ -50,6 +50,10 @@ pub trait Pool: Send + Sync {
         false
     }
     fn url(&self) -> &str;
+    /// (accepted, rejected) share counts.
+    fn shares(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +106,8 @@ impl Pool for MockPool {
 struct Shared {
     current: Mutex<Option<Arc<Job>>>,
     req_id: AtomicU64,
+    accepted: AtomicU64,
+    rejected: AtomicU64,
 }
 
 pub struct StratumPool {
@@ -115,6 +121,8 @@ impl StratumPool {
         let shared = Arc::new(Shared {
             current: Mutex::new(None),
             req_id: AtomicU64::new(1),
+            accepted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
         });
         let (tx, rx) = mpsc::channel::<String>();
 
@@ -152,6 +160,13 @@ impl Pool for StratumPool {
     fn url(&self) -> &str {
         &self.url
     }
+
+    fn shares(&self) -> (u64, u64) {
+        (
+            self.shared.accepted.load(Ordering::Relaxed),
+            self.shared.rejected.load(Ordering::Relaxed),
+        )
+    }
 }
 
 fn io_loop(url: String, user: String, pass: String, shared: Arc<Shared>, rx: Receiver<String>) {
@@ -174,8 +189,8 @@ fn set_read_timeout(
         MaybeTlsStream::Plain(s) => {
             let _ = s.set_read_timeout(dur);
         }
-        MaybeTlsStream::NativeTls(s) => {
-            let _ = s.get_ref().set_read_timeout(dur);
+        MaybeTlsStream::Rustls(s) => {
+            let _ = s.sock.set_read_timeout(dur);
         }
         _ => {}
     }
@@ -275,8 +290,14 @@ fn handle_message(text: &str, shared: &Arc<Shared>) {
         }
     }
     match v.get("result") {
-        Some(serde_json::Value::Bool(true)) => log::info!("share accepted"),
-        Some(serde_json::Value::Bool(false)) => log::warn!("share rejected"),
+        Some(serde_json::Value::Bool(true)) => {
+            shared.accepted.fetch_add(1, Ordering::Relaxed);
+            log::info!("share accepted");
+        }
+        Some(serde_json::Value::Bool(false)) => {
+            shared.rejected.fetch_add(1, Ordering::Relaxed);
+            log::warn!("share rejected");
+        }
         Some(serde_json::Value::String(s)) => log::debug!("subscription id {s}"),
         _ => {}
     }

@@ -1,0 +1,6 @@
+target
+.git
+*.exe
+vulkminer
+*.tar.gz
+miner-address.txt

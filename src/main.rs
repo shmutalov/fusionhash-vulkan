@@ -79,7 +79,7 @@ fn main() -> Result<()> {
     log::info!("pool: {}", pool.url());
 
     // Spin up a miner thread per device.
-    let mut reporters: Vec<(String, Arc<AtomicU64>)> = Vec::new();
+    let mut reporters: Vec<Reporter> = Vec::new();
     for (idx, pd) in chosen.iter().enumerate() {
         if MEMORY * cfg.tps as u64 > pd.max_alloc {
             bail!(
@@ -104,7 +104,11 @@ fn main() -> Result<()> {
         );
 
         let hr = Arc::new(AtomicU64::new(0));
-        reporters.push((pd.name.clone(), hr.clone()));
+        reporters.push(Reporter {
+            name: pd.name.clone(),
+            bus: pd.pci_bus,
+            hashrate: hr.clone(),
+        });
         let pool = pool.clone();
         let dev = idx + 1;
         std::thread::spawn(move || {
@@ -114,18 +118,58 @@ fn main() -> Result<()> {
         });
     }
 
-    // Hashrate reporting.
+    // Hashrate reporting + optional stats file.
+    let start = Instant::now();
+    let stats_file = cfg.stats_file.clone();
     loop {
         std::thread::sleep(Duration::from_secs(10));
         let mut total = 0u64;
-        for (name, hr) in &reporters {
-            let v = hr.load(Ordering::Relaxed);
+        for r in &reporters {
+            let v = r.hashrate.load(Ordering::Relaxed);
             total += v;
-            log::info!("{name}: {:.3} kH/s", v as f64 / 1000.0);
+            log::info!("{}: {:.3} kH/s", r.name, v as f64 / 1000.0);
         }
         if reporters.len() > 1 {
             log::info!("total: {:.3} kH/s", total as f64 / 1000.0);
         }
+        if !stats_file.is_empty() {
+            let (acc, rej) = pool.shares();
+            write_stats(&stats_file, &reporters, start.elapsed().as_secs(), acc, rej);
+        }
+    }
+}
+
+struct Reporter {
+    name: String,
+    bus: u32,
+    hashrate: Arc<AtomicU64>,
+}
+
+fn write_stats(path: &str, reporters: &[Reporter], uptime: u64, accepted: u64, rejected: u64) {
+    // kH/s throughout (hs_units = khs on the HiveOS side).
+    let total_khs: f64 = reporters
+        .iter()
+        .map(|r| r.hashrate.load(Ordering::Relaxed) as f64 / 1000.0)
+        .sum();
+    let gpus: Vec<String> = reporters
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"bus\":{},\"name\":{},\"khs\":{:.3}}}",
+                r.bus,
+                serde_json::to_string(&r.name).unwrap_or_else(|_| "\"\"".into()),
+                r.hashrate.load(Ordering::Relaxed) as f64 / 1000.0
+            )
+        })
+        .collect();
+    let json = format!(
+        "{{\"algo\":\"cn/gpu\",\"uptime\":{uptime},\"khs\":{total_khs:.3},\"accepted\":{accepted},\"rejected\":{rejected},\"gpus\":[{}]}}",
+        gpus.join(",")
+    );
+    // Write atomically-ish: temp file then rename.
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 

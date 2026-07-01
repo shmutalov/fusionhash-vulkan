@@ -64,6 +64,7 @@ pub struct PhysicalDevice {
     pub compute_units: u32,
     pub subgroup_size: u32,
     pub driver_info: String,
+    pub pci_bus: u32,
 }
 
 impl PhysicalDevice {
@@ -88,10 +89,12 @@ impl PhysicalDevice {
         let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
         let mut driver = vk::PhysicalDeviceDriverProperties::default();
         let mut maint3 = vk::PhysicalDeviceMaintenance3Properties::default();
+        let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut subgroup)
             .push_next(&mut driver)
-            .push_next(&mut maint3);
+            .push_next(&mut maint3)
+            .push_next(&mut pci);
         unsafe { instance.get_physical_device_properties2(handle, &mut props2) };
 
         let driver_info = unsafe { CStr::from_ptr(driver.driver_info.as_ptr()) }
@@ -125,6 +128,7 @@ impl PhysicalDevice {
             compute_units,
             subgroup_size: subgroup.subgroup_size,
             driver_info,
+            pci_bus: pci.pci_bus,
         }
     }
 

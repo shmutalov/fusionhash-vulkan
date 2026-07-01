@@ -53,6 +53,10 @@ pub struct Config {
     /// allocation limit).
     #[arg(long, default_value_t = 960)]
     pub tps: u32,
+
+    /// Write a JSON stats file periodically (for HiveOS / monitoring).
+    #[arg(long, default_value = "")]
+    pub stats_file: String,
 }
 
 impl Config {
