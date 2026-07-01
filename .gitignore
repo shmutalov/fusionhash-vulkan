@@ -1,2 +1,4 @@
 /target
 miner-address.txt
+/vulkminer
+*.tar.gz
