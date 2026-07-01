@@ -1,0 +1,128 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "aes.glsl"
+
+// cn2: "implode" the scratchpad back into the state with AES, run the final
+// Keccak permutation, and flag lanes whose PoW value is <= target.
+
+const uint WORKSIZE = 8u;                       // hashes per workgroup
+layout(local_size_x = 8, local_size_y = 8) in; // (8 aes lanes, WORKSIZE hashes)
+
+layout(std430, binding = 0) readonly buffer Scratch { uvec4 data[]; } spad;
+layout(std430, binding = 1) coherent buffer States  { uint64_t st[]; } states;
+layout(std430, binding = 2) buffer Output { uint data[]; } outp;   // [0..254]=lanes, [255]=count
+#ifdef DEBUG_HASH
+layout(std430, binding = 3) writeonly buffer DebugHash { uint64_t data[]; } dbg;
+#endif
+
+layout(push_constant) uniform Push { uint64_t target; } pc;
+
+const uint MEMORY = 2097152u;
+const uint SP_STRIDE = MEMORY / 16u;   // uvec4 units per lane
+const uint LOOP_ITERS = MEMORY / 128u;
+
+shared uint AES0[256];
+shared uint AES1[256];
+shared uint AES2[256];
+shared uint AES3[256];
+shared uvec4 xin1[WORKSIZE][8];
+shared uvec4 xin2[WORKSIZE][8];
+
+uint lo32(uint64_t v) { return uint(v); }
+uint hi32(uint64_t v) { return uint(v >> 32); }
+uint64_t pack64(uint lo, uint hi) { return uint64_t(lo) | (uint64_t(hi) << 32); }
+
+uvec4 AES_Round(uvec4 X, uvec4 k) {
+    k.x ^= AES0[BYTE(X.x, 0u)]; k.y ^= AES0[BYTE(X.y, 0u)]; k.z ^= AES0[BYTE(X.z, 0u)]; k.w ^= AES0[BYTE(X.w, 0u)];
+    k.x ^= AES2[BYTE(X.z, 2u)]; k.y ^= AES2[BYTE(X.w, 2u)]; k.z ^= AES2[BYTE(X.x, 2u)]; k.w ^= AES2[BYTE(X.y, 2u)];
+    k.x ^= AES1[BYTE(X.y, 1u)]; k.y ^= AES1[BYTE(X.z, 1u)]; k.z ^= AES1[BYTE(X.w, 1u)]; k.w ^= AES1[BYTE(X.x, 1u)];
+    k.x ^= AES3[BYTE(X.w, 3u)]; k.y ^= AES3[BYTE(X.x, 3u)]; k.z ^= AES3[BYTE(X.y, 3u)]; k.w ^= AES3[BYTE(X.z, 3u)];
+    return k;
+}
+
+void main() {
+    uint gIdx     = gl_GlobalInvocationID.y;   // hash lane
+    uint groupIdx = gl_LocalInvocationID.y;    // 0..WORKSIZE-1
+    uint lIdx     = gl_LocalInvocationID.x;    // 0..7
+
+    // Populate the four AES tables cooperatively.
+    uint llid = groupIdx * 8u + lIdx;
+    for (uint i = llid; i < 256u; i += 64u) {
+        uint t = AES0_C[i];
+        AES0[i] = t;
+        AES1[i] = rotl32(t, 8u);
+        AES2[i] = rotl32(t, 16u);
+        AES3[i] = rotl32(t, 24u);
+    }
+    barrier();
+
+    uint sbase = gIdx * 25u;
+
+    // text = vload4(lIdx + 4, states)  (state words 8..23 across the 8 lanes)
+    uint u = (lIdx + 4u) * 2u;
+    uvec4 text = uvec4(lo32(states.st[sbase + u]),     hi32(states.st[sbase + u]),
+                       lo32(states.st[sbase + u + 1u]), hi32(states.st[sbase + u + 1u]));
+
+    // ExpandedKey2 = vload8(1, states)  (the 256-bit AES key from words 4..7)
+    uint ExpandedKey2[40];
+    for (uint j = 0u; j < 8u; ++j) {
+        uint64_t v = states.st[sbase + 4u + j / 2u];
+        ExpandedKey2[j] = ((j & 1u) == 0u) ? lo32(v) : hi32(v);
+    }
+    AESExpandKey256(ExpandedKey2);
+    barrier();
+
+    xin2[groupIdx][lIdx] = uvec4(0u);
+
+    uint spb = gIdx * SP_STRIDE;
+    uint i1 = lIdx;
+    for (uint i = 0u; i < LOOP_ITERS; ++i) {
+        text ^= spad.data[spb + i1];
+        barrier();
+        text ^= xin2[groupIdx][(lIdx + 1u) % 8u];
+        for (uint j = 0u; j < 10u; ++j)
+            text = AES_Round(text, uvec4(ExpandedKey2[j*4u], ExpandedKey2[j*4u+1u], ExpandedKey2[j*4u+2u], ExpandedKey2[j*4u+3u]));
+        xin1[groupIdx][lIdx] = text;
+
+        text ^= spad.data[spb + i1 + 8u];
+        barrier();
+        text ^= xin1[groupIdx][(lIdx + 1u) % 8u];
+        for (uint j = 0u; j < 10u; ++j)
+            text = AES_Round(text, uvec4(ExpandedKey2[j*4u], ExpandedKey2[j*4u+1u], ExpandedKey2[j*4u+2u], ExpandedKey2[j*4u+3u]));
+        xin2[groupIdx][lIdx] = text;
+
+        i1 = (i1 + 16u) % SP_STRIDE;
+    }
+    barrier();
+    text ^= xin2[groupIdx][(lIdx + 1u) % 8u];
+
+    for (uint i = 0u; i < 16u; ++i) {
+        for (uint j = 0u; j < 10u; ++j)
+            text = AES_Round(text, uvec4(ExpandedKey2[j*4u], ExpandedKey2[j*4u+1u], ExpandedKey2[j*4u+2u], ExpandedKey2[j*4u+3u]));
+        barrier();
+        xin1[groupIdx][lIdx] = text;
+        barrier();
+        text ^= xin1[groupIdx][(lIdx + 1u) % 8u];
+    }
+
+    states.st[sbase + u]      = pack64(text.x, text.y);
+    states.st[sbase + u + 1u] = pack64(text.z, text.w);
+    memoryBarrierBuffer();
+    barrier();
+
+    if (lIdx == 0u) {
+        uint64_t St[25];
+        for (int i = 0; i < 25; ++i) St[i] = states.st[sbase + uint(i)];
+        keccak_f1600(St);
+        uint64_t pv = bswap64(St[0]);
+#ifdef DEBUG_HASH
+        dbg.data[gIdx] = pv;
+#endif
+        if (pv <= pc.target) {
+            uint outIdx = atomicAdd(outp.data[255], 1u);
+            if (outIdx < 255u) outp.data[outIdx] = gIdx;
+        }
+    }
+}

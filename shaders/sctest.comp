@@ -1,0 +1,37 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Micro-test: run single_compute for a batch of input records so the CPU
+// reference can be compared operation-by-operation against the GPU.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer In  { int   v[]; };   // 16 ints per record
+layout(std430, binding = 1) readonly buffer Rc  { float rc[]; };  // 8 floats per record: [0..3]=rnd_c, [4]=cnt
+layout(std430, binding = 2) writeonly buffer OutI { int   oi[]; }; // 4 ints per record
+layout(std430, binding = 3) writeonly buffer OutF { uint  of[]; }; // 4 float-bits per record (the `sum`/va)
+
+layout(push_constant) uniform P { uint count; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+
+    ivec4 v0 = ivec4(v[16u*i+0u],  v[16u*i+1u],  v[16u*i+2u],  v[16u*i+3u]);
+    ivec4 v1 = ivec4(v[16u*i+4u],  v[16u*i+5u],  v[16u*i+6u],  v[16u*i+7u]);
+    ivec4 v2 = ivec4(v[16u*i+8u],  v[16u*i+9u],  v[16u*i+10u], v[16u*i+11u]);
+    ivec4 v3 = ivec4(v[16u*i+12u], v[16u*i+13u], v[16u*i+14u], v[16u*i+15u]);
+    vec4 rnd_c = vec4(rc[8u*i+0u], rc[8u*i+1u], rc[8u*i+2u], rc[8u*i+3u]);
+    float cnt = rc[8u*i+4u];
+
+    vec4 sum;
+    ivec4 r = single_compute(vec4(v0), vec4(v1), vec4(v2), vec4(v3), cnt, rnd_c, sum);
+
+    oi[4u*i+0u] = r.x; oi[4u*i+1u] = r.y; oi[4u*i+2u] = r.z; oi[4u*i+3u] = r.w;
+    of[4u*i+0u] = floatBitsToUint(sum.x);
+    of[4u*i+1u] = floatBitsToUint(sum.y);
+    of[4u*i+2u] = floatBitsToUint(sum.z);
+    of[4u*i+3u] = floatBitsToUint(sum.w);
+}

@@ -1,0 +1,48 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// cn00: "explode" — fill each 2 MiB scratchpad from the Keccak state using the
+// cn/gpu generate_512 expansion (3 Keccak permutations emitting 20/22/22 words).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer Scratch { uint64_t data[]; } scratch;
+layout(std430, binding = 1) readonly  buffer States { uint64_t st[]; } states;
+
+const uint MEMORY = 2097152u;      // 2 MiB scratchpad
+const uint MEM_U64 = MEMORY / 8u;  // 262144 words per lane
+const uint BLOCKS  = MEMORY / 512u; // 4096 blocks of 512 bytes (64 words)
+
+shared uint64_t State[25];
+
+void generate_512(uint idx, uint out_base) {
+    uint64_t hash[25];
+    hash[0] = State[0] ^ uint64_t(idx);
+    for (int i = 1; i < 25; ++i) hash[i] = State[i];
+
+    uint o = out_base;
+    keccak_f1600(hash);
+    for (uint i = 0u; i < 20u; ++i) scratch.data[o + i] = hash[i];
+    o += 20u;
+    keccak_f1600(hash);
+    for (uint i = 0u; i < 22u; ++i) scratch.data[o + i] = hash[i];
+    o += 22u;
+    keccak_f1600(hash);
+    for (uint i = 0u; i < 22u; ++i) scratch.data[o + i] = hash[i];
+}
+
+void main() {
+    uint gIdx = gl_GlobalInvocationID.x / 64u;   // hash lane
+    uint lid  = gl_LocalInvocationID.x;          // 0..63
+
+    uint sbase = gIdx * 25u;
+    for (uint i = lid; i < 25u; i += 64u) State[i] = states.st[sbase + i];
+    barrier();
+
+    uint lane_base = gIdx * MEM_U64;
+    for (uint i = lid; i < BLOCKS; i += 64u) {
+        generate_512(i, lane_base + i * 64u);
+    }
+}

@@ -1,0 +1,32 @@
+[package]
+name = "fusionhash-vulkan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "FusionHash (CryptoNight-GPU) miner with a Vulkan compute backend, tuned for AMD RDNA3 (RX 7900 XT)"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "vulkminer"
+path = "src/main.rs"
+
+[dependencies]
+ash = { version = "0.38", features = ["std", "loaded", "debug"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = { version = "0.24", features = ["native-tls"] }
+url = "2"
+hex = "0.4"
+
+[build-dependencies]
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

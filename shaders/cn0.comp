@@ -1,0 +1,35 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// cn0: absorb the (input || nonce) blob with Keccak-f[1600] and write the
+// 25-word state for each hash lane.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Input  { uint64_t data[]; } inp;    // 128 bytes = 16 words
+layout(std430, binding = 1) writeonly buffer States { uint64_t st[]; } states;  // 25 words per lane
+
+layout(push_constant) uniform Push {
+    uint64_t nonce_base;   // extraNonce + startNonce + shard_offset
+    uint     num_threads;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.num_threads) return;
+
+    uint64_t State[25];
+    for (int i = 0; i < 8; ++i) State[i] = inp.data[i];
+    State[8]  = bswap64(pc.nonce_base + uint64_t(gid));
+    State[9]  = inp.data[9];
+    State[10] = inp.data[10];
+    for (int i = 11; i < 25; ++i) State[i] = 0ul;
+    State[16] = 0x8000000000000000ul;
+
+    keccak_f1600(State);
+
+    uint base = gid * 25u;
+    for (int i = 0; i < 25; ++i) states.st[base + uint(i)] = State[i];
+}

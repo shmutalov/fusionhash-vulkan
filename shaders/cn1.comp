@@ -1,0 +1,103 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// cn1: the cn/gpu memory-hard core. 16 lanes cooperate per hash. Each of the
+// ITERATIONS rounds runs the FP32 "single_compute" mixing function and folds
+// the result back into the scratchpad. This is the bit-exact hot loop.
+
+const uint CN1_CHUNKS = 4u;                 // hashes per workgroup
+layout(local_size_x = 16u * CN1_CHUNKS) in; // 64 invocations
+
+layout(std430, binding = 0) buffer Scratch { int data[]; } spad;      // scratchpad, 32-bit view
+layout(std430, binding = 1) readonly buffer States { uint64_t st[]; } states;
+
+const uint MEMORY = 2097152u;
+const uint MASK   = 0x1FFFC0u;
+const uint MEM_I32 = MEMORY / 4u;     // 32-bit words per lane
+const uint ITERATIONS = 49152u;
+
+// 64 ints / 64 floats per chunk aliasing the reference `SharedMemChunk`.
+shared int   sout[CN1_CHUNKS * 64u];
+shared float sva [CN1_CHUNKS * 64u];
+
+ivec4 rd_slot(uint base, uint j) {
+    uint b = base + 4u * j;
+    return ivec4(sout[b], sout[b + 1u], sout[b + 2u], sout[b + 3u]);
+}
+void wr_out_slot(uint base, uint j, ivec4 v) {
+    uint b = base + 4u * j;
+    sout[b] = v.x; sout[b + 1u] = v.y; sout[b + 2u] = v.z; sout[b + 3u] = v.w;
+}
+void wr_va_slot(uint base, uint j, vec4 v) {
+    uint b = base + 4u * j;
+    sva[b] = v.x; sva[b + 1u] = v.y; sva[b + 2u] = v.z; sva[b + 3u] = v.w;
+}
+
+void main() {
+    uint gIdx    = gl_GlobalInvocationID.x;
+    uint chunk   = gl_LocalInvocationID.x / 16u;
+    uint tid     = gl_LocalInvocationID.x % 16u;
+    uint idxHash = gIdx / 16u;
+    uint base    = chunk * 64u;
+    uint lpad_base = MEM_I32 * idxHash;
+
+    uint s = uint(states.st[idxHash * 25u]) >> 8u;   // low 32 bits of State[0], >> 8
+    vec4 vs = vec4(0.0);
+
+    uint tidd  = tid / 4u;
+    uint tidm  = tid % 4u;
+    uint block = tidd * 16u + tidm;
+
+    for (uint it = 0u; it < ITERATIONS; ++it) {
+        barrier();
+        uint sp_idx = lpad_base + ((s & MASK) >> 2u) + tidd * 4u + tidm;
+        int tmp = spad.data[sp_idx];
+        sout[base + tid] = tmp;
+        barrier();
+
+        vec4  va_out;
+        ivec4 out_val;
+        single_compute_wrap(
+            tidm,
+            rd_slot(base, cn_look[tid * 4u + 0u]),
+            rd_slot(base, cn_look[tid * 4u + 1u]),
+            rd_slot(base, cn_look[tid * 4u + 2u]),
+            rd_slot(base, cn_look[tid * 4u + 3u]),
+            cn_ccnt[tid], vs, va_out, out_val);
+        wr_va_slot(base, tid, va_out);
+        wr_out_slot(base, tid, out_val);
+        barrier();
+
+        int outXor = sout[base + block];
+        for (uint dd = block + 4u; dd < (tidd + 1u) * 16u; dd += 4u)
+            outXor ^= sout[base + dd];
+
+        spad.data[sp_idx] = outXor ^ tmp;
+        sout[base + tid] = outXor;
+
+        // `precise` so the driver may not reassociate/contract these reductions;
+        // the reference computes them strictly as written.
+        precise float va_tmp1 = sva[base + block]      + sva[base + block + 4u];
+        precise float va_tmp2 = sva[base + block + 8u] + sva[base + block + 12u];
+        precise float va_r = va_tmp1 + va_tmp2;
+        sva[base + tid] = va_r;
+        barrier();
+
+        int out2 = sout[base + tid] ^ sout[base + tid + 4u] ^ sout[base + tid + 8u] ^ sout[base + tid + 12u];
+        precise float w1 = sva[base + block]      + sva[base + block + 4u];
+        precise float w2 = sva[base + block + 8u] + sva[base + block + 12u];
+        precise float w = w1 + w2;
+        w = abs(w);
+
+        precise float xx = w * 16777216.0;
+        int xx_int = int(xx);
+        sout[base + tid] = out2 ^ xx_int;
+        sva[base + tid] = w / 64.0;
+        barrier();
+
+        vs = vec4(sva[base], sva[base + 1u], sva[base + 2u], sva[base + 3u]);
+        s = uint(sout[base] ^ sout[base + 1u] ^ sout[base + 2u] ^ sout[base + 3u]);
+    }
+}
