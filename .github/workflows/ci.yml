@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+
+# The deploy job creates a GitHub release, which needs write access to contents.
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded branch runs, but never interrupt a tag/release build.
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+jobs:
+  # --------------------------------------------------------------------------
+  # test — compile everything, run the unit tests, lint (advisory).
+  # The GPU self-tests (--selftest / --microtest) need a Vulkan device, so they
+  # cannot run on hosted runners; build.rs falls back to the committed SPIR-V,
+  # so no Vulkan SDK is required here.
+  # --------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust toolchain
+        run: rustup update stable && rustup default stable && rustup component add clippy
+
+      - name: Version consistency (Cargo.toml vs HiveOS manifest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          hive_ver=$(grep -m1 CUSTOM_VERSION hiveos/h-manifest.conf | cut -d= -f2)
+          echo "Cargo.toml=$cargo_ver  hiveos/h-manifest.conf=$hive_ver"
+          if [ "$cargo_ver" != "$hive_ver" ]; then
+            echo "::error::version mismatch: Cargo.toml ($cargo_ver) != h-manifest.conf ($hive_ver)"
+            exit 1
+          fi
+
+      - name: Build & test
+        run: cargo test --locked
+
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets
+        continue-on-error: true
+
+  # --------------------------------------------------------------------------
+  # build — release binaries for Linux + Windows, plus the HiveOS tarball.
+  # Assets are named exactly as they are published on the release.
+  # --------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.name }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: windows-x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust toolchain
+        run: rustup update stable && rustup default stable
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Stage assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version: $ver"
+          if [ "${{ matrix.name }}" = "windows-x64" ]; then
+            cp target/release/vulkminer.exe "dist/vulkminer-v${ver}-windows-x64.exe"
+          else
+            cp target/release/vulkminer "dist/vulkminer-v${ver}-linux-x64"
+            # HiveOS custom-miner package: Linux binary + h-* scripts.
+            cp target/release/vulkminer ./vulkminer
+            bash hiveos/package.sh
+            mv "vulkminer-hiveos-${ver}.tar.gz" dist/
+          fi
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # deploy — on a v* tag, gather the built assets and publish a GitHub release.
+  # Uses the preinstalled gh CLI + GITHUB_TOKEN; no third-party actions.
+  # --------------------------------------------------------------------------
+  deploy:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "${GITHUB_REF_NAME}" != "v${ver}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${ver}"
+            exit 1
+          fi
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*

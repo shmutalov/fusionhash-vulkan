@@ -6,7 +6,10 @@ cd "$(dirname "$0")/.."
 
 VER=$(grep -m1 CUSTOM_VERSION hiveos/h-manifest.conf | cut -d= -f2)
 NAME=vulkminer
-OUT="${NAME}-${VER}.tar.gz"
+# Archive name carries the "hiveos" tag so it is distinguishable from the plain
+# platform binaries on the release page. The unpacked top-level dir stays $NAME
+# (== CUSTOM_NAME) because HiveOS expects <CUSTOM_NAME>/h-manifest.conf.
+OUT="${NAME}-hiveos-${VER}.tar.gz"
 
 if [[ ! -f ./vulkminer ]]; then
     echo "error: ./vulkminer not found — run: bash hiveos/build-linux.sh" >&2

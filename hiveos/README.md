@@ -9,7 +9,7 @@ From the repo root:
 
 ```bash
 bash hiveos/build-linux.sh     # builds ./vulkminer (linux x86_64) via Docker
-bash hiveos/package.sh         # -> vulkminer-0.1.1.tar.gz
+bash hiveos/package.sh         # -> vulkminer-hiveos-0.1.1.tar.gz
 ```
 
 `build-linux.sh` uses [Dockerfile](Dockerfile) (a plain `rust` image — no Vulkan
@@ -22,7 +22,7 @@ Alternatively, build directly on a rig / any Linux box with Rust installed:
 cargo build --release          # -> target/release/vulkminer
 ```
 
-The prebuilt `vulkminer-<version>.tar.gz` is also attached to the GitHub release.
+The prebuilt `vulkminer-hiveos-<version>.tar.gz` is also attached to the GitHub release.
 
 ## 2. Install the custom miner in HiveOS
 
@@ -30,10 +30,10 @@ Host the tarball somewhere reachable (the GitHub release URL works), then on the
 rig **Miners** step of the flight sheet choose **Custom** and set:
 
 - **Miner name**: `vulkminer`
-- **Installation URL**: the direct link to `vulkminer-0.1.1.tar.gz`
+- **Installation URL**: the direct link to `vulkminer-hiveos-0.1.1.tar.gz`
 
 HiveOS downloads and unpacks it to `/hive/miners/custom/vulkminer/`. You can also
-`hpkg install vulkminer-0.1.1.tar.gz` on the rig directly.
+`hpkg install vulkminer-hiveos-0.1.1.tar.gz` on the rig directly.
 
 ## 3. Flight sheet
 
