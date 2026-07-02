@@ -118,6 +118,12 @@ pub struct StratumPool {
 
 impl StratumPool {
     pub fn connect(url: &str, user: String, pass: String) -> Result<Self> {
+        // rustls 0.23 no longer auto-selects a crypto provider at first use, so
+        // the initial `wss://` handshake would otherwise panic. Install the ring
+        // provider once as the process default. An Err here just means one is
+        // already installed, which is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let shared = Arc::new(Shared {
             current: Mutex::new(None),
             req_id: AtomicU64::new(1),
