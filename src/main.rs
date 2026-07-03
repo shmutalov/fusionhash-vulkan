@@ -260,18 +260,26 @@ fn mine_loop(mut miner: Miner, pool: Arc<dyn Pool>, hashrate: Arc<AtomicU64>, de
                 hashes_since = 0;
             }
 
-            if pool.is_mock() {
-                continue;
-            }
-
-            for nonce in candidates {
-                let pow = cnhash::fusion_hash(&input, nonce);
-                if pow <= job.target {
-                    log::info!("device [{dev}] share found nonce=0x{nonce:016x} pow=0x{pow:016x}");
-                    pool.submit(&job, nonce);
-                } else {
-                    log::debug!("device [{dev}] false positive nonce=0x{nonce:016x} pow=0x{pow:016x}");
-                }
+            // Verify + submit candidates on a background thread. The CPU
+            // re-hash (`fusion_hash`) takes hundreds of ms; doing it inline
+            // stalled the GPU until it finished, which is what made the pool
+            // hashrate spike down whenever shares were found. Hand the work off
+            // and immediately launch the next GPU pass. Mock has target 0, so it
+            // never produces candidates and never spawns a thread.
+            if !pool.is_mock() && !candidates.is_empty() {
+                let pool = pool.clone();
+                let job = job.clone();
+                std::thread::spawn(move || {
+                    for nonce in candidates {
+                        let pow = cnhash::fusion_hash(&input, nonce);
+                        if pow <= job.target {
+                            log::info!("device [{dev}] share found nonce=0x{nonce:016x} pow=0x{pow:016x}");
+                            pool.submit(&job, nonce);
+                        } else {
+                            log::debug!("device [{dev}] false positive nonce=0x{nonce:016x} pow=0x{pow:016x}");
+                        }
+                    }
+                });
             }
         }
     }
