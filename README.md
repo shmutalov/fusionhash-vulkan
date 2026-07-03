@@ -104,17 +104,16 @@ mis-mapped target cannot produce a rejected share, only a missed one.
 * The correctly-rounded fp32 divide has three variants, selected at build time
   with the `CRDIV` env var (all bit-exact — verified by `--microtest` /
   `--selftest`):
-  * `CRDIV=markstein` (default) — bit-hack reciprocal seed + 3 Newton steps. The
-    seed is driver-independent (a pure integer op), so it needs no guarantees
-    from the driver's `OpFDiv`.
-  * `CRDIV=rcp` — seed the reciprocal from the hardware divide (`1.0/|b|`, one
-    `v_rcp`, ≤2.5 ULP) and do a single Newton step. One step from a ~22-bit seed
-    reaches the same fp32 rounding floor the bit-hack needs three for, so the
-    Markstein residual correction still pins the correctly-rounded quotient on any
-    conformant driver. ~4 fewer FMAs and it offloads the seed onto the
-    transcendental unit; measured **+2.4 % on a 7900 XT** (larger gains expected
-    where the FP32 ALU is the bottleneck, i.e. RDNA1/2). Validate with
-    `--selftest` on the target card before shipping.
+  * `CRDIV=rcp` (default) — seed the reciprocal from the hardware divide
+    (`1.0/|b|`, one `v_rcp`, ≤2.5 ULP) and do a single Newton step. One step from
+    a ~22-bit seed reaches the same fp32 rounding floor the bit-hack needs three
+    for, so the Markstein residual correction still pins the correctly-rounded
+    quotient on any conformant driver. ~4 fewer FMAs and it offloads the seed onto
+    the transcendental unit; measured **+2.4 % on a 7900 XT** (larger gains
+    expected where the FP32 ALU is the bottleneck, i.e. RDNA1/2).
+  * `CRDIV=markstein` — bit-hack reciprocal seed + 3 Newton steps. The seed is
+    driver-independent (a pure integer op), so it needs no guarantees from the
+    driver's `OpFDiv` — the conservative fallback if a driver's divide misbehaves.
   * `CRDIV=fp64` — divide in fp64 and round back; ~9 % slower on RDNA3 and far
     slower on cards with 1/16-rate fp64 (RDNA1/2). Reference/fallback only.
 * Cooperative-kernel wavefront size is pinned with `--wave auto|driver|32|64`

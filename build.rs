@@ -45,13 +45,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CRDIV");
 
     // Correctly-rounded fp32 divide variant for the cn/gpu core (cn1 / sctest):
-    //   (unset)/markstein -> bit-hack seed + 3 Newton steps (default)
-    //   rcp               -> hardware reciprocal seed + 1 Newton step
-    //   fp64              -> divide in fp64 and round back
+    //   (unset)/rcp -> hardware reciprocal seed + 1 Newton step (default)
+    //   markstein   -> bit-hack seed + 3 Newton steps (driver-independent seed)
+    //   fp64        -> divide in fp64 and round back
     let crdiv: Vec<&str> = match std::env::var("CRDIV").ok().as_deref() {
-        Some("rcp") => vec!["CRDIV_RCP"],
+        Some("markstein") => vec![],
         Some("fp64") => vec!["CRDIV_FP64"],
-        _ => vec![],
+        _ => vec!["CRDIV_RCP"],
     };
 
     let glslc = find_glslc();
