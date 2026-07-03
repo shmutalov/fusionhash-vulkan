@@ -10,6 +10,24 @@ use std::sync::Arc;
 pub const AMD_VENDOR_ID: u32 = 0x1002;
 pub const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 
+/// Preferred wavefront (subgroup) size for the cooperative kernels (cn1/cn2).
+///
+/// The cn/gpu cross-lane reductions cooperate in 16-lane groups. The upstream
+/// OpenCL relies on those lanes running lockstep inside one wavefront and uses a
+/// cheap `mem_fence`; this port uses a full workgroup `barrier()`, which is only
+/// free when the whole workgroup is a *single* wave. If the driver compiles the
+/// 64-thread cn1/cn2 workgroup as two wave32 waves (common on RDNA1/2), every
+/// barrier becomes a real cross-wave sync. Pinning the subgroup size to 64 makes
+/// the workgroup exactly one wave on all RDNA cards, so the barrier collapses to
+/// a no-op — matching upstream's behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WavePref {
+    /// Let the driver choose (wave64 on AMD via [`Gpu::required_subgroup_size`]).
+    Auto,
+    /// Force a specific subgroup size if the device supports it.
+    Force(u32),
+}
+
 pub struct Instance {
     // Kept alive so the Vulkan loader stays loaded for the process lifetime.
     #[allow(dead_code)]
@@ -63,6 +81,13 @@ pub struct PhysicalDevice {
     pub max_alloc: u64,
     pub compute_units: u32,
     pub subgroup_size: u32,
+    /// Subgroup-size-control range (Vulkan 1.3). Zero when the device predates
+    /// 1.3 / does not advertise the feature.
+    pub min_subgroup_size: u32,
+    pub max_subgroup_size: u32,
+    /// `subgroupSizeControl` feature is available *and* the compute stage is in
+    /// `requiredSubgroupSizeStages` — i.e. we may pin a required size on cn1/cn2.
+    pub subgroup_size_control: bool,
     pub driver_info: String,
     pub pci_bus: u32,
 }
@@ -90,12 +115,24 @@ impl PhysicalDevice {
         let mut driver = vk::PhysicalDeviceDriverProperties::default();
         let mut maint3 = vk::PhysicalDeviceMaintenance3Properties::default();
         let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+        let mut ssc_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut subgroup)
             .push_next(&mut driver)
             .push_next(&mut maint3)
-            .push_next(&mut pci);
+            .push_next(&mut pci)
+            .push_next(&mut ssc_props);
         unsafe { instance.get_physical_device_properties2(handle, &mut props2) };
+
+        // Subgroup-size-control feature (Vulkan 1.3 core). Needed before we may
+        // request a fixed subgroup size on a pipeline stage.
+        let mut ssc_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+        let mut feats2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut ssc_feat);
+        unsafe { instance.get_physical_device_features2(handle, &mut feats2) };
+        let subgroup_size_control = ssc_feat.subgroup_size_control == vk::TRUE
+            && ssc_props
+                .required_subgroup_size_stages
+                .contains(vk::ShaderStageFlags::COMPUTE);
 
         let driver_info = unsafe { CStr::from_ptr(driver.driver_info.as_ptr()) }
             .to_string_lossy()
@@ -127,6 +164,9 @@ impl PhysicalDevice {
             max_alloc,
             compute_units,
             subgroup_size: subgroup.subgroup_size,
+            min_subgroup_size: ssc_props.min_subgroup_size,
+            max_subgroup_size: ssc_props.max_subgroup_size,
+            subgroup_size_control,
             driver_info,
             pci_bus: pci.pci_bus,
         }
@@ -178,11 +218,20 @@ impl Gpu {
         features.shader_int64 = vk::TRUE;
         features.shader_float64 = vk::TRUE;
 
+        // Enable subgroupSizeControl when available so cn1/cn2 can pin their
+        // wavefront size (see `WavePref`). Enabling a supported feature is inert
+        // until a pipeline actually requests a fixed size.
+        let mut ssc_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+            .subgroup_size_control(true);
+
         // Vulkan 1.2 features: 8-bit/16-bit storage are not required, but we do
         // rely on shaderBufferInt64Atomics? No — plain uint atomics only.
-        let dci = vk::DeviceCreateInfo::default()
+        let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qcis)
             .enabled_features(&features);
+        if pdev.subgroup_size_control {
+            dci = dci.push_next(&mut ssc_feat);
+        }
 
         let device = unsafe { raw.create_device(pdev.handle, &dci, None) }
             .context("failed to create logical device")?;
@@ -274,6 +323,26 @@ impl Gpu {
             .context("failed to read SPIR-V")?;
         let ci = vk::ShaderModuleCreateInfo::default().code(&code);
         Ok(unsafe { self.device.create_shader_module(&ci, None) }?)
+    }
+
+    /// Resolve the required subgroup size to request on the cooperative kernels,
+    /// or `None` to leave the driver's default. Returns `None` when the device
+    /// cannot honour a fixed size, or when the requested size is out of range /
+    /// not a power of two (the caller warns in that case).
+    pub fn required_subgroup_size(&self, pref: WavePref) -> Option<u32> {
+        let pd = &self.pdev;
+        if !pd.subgroup_size_control {
+            return None;
+        }
+        let supported = |n: u32| {
+            n.is_power_of_two() && n >= pd.min_subgroup_size && n <= pd.max_subgroup_size
+        };
+        match pref {
+            // Force one wave per cooperative workgroup on AMD (wave64), so the
+            // cn1/cn2 barriers become intra-wave no-ops.
+            WavePref::Auto => (pd.is_amd() && supported(64)).then_some(64),
+            WavePref::Force(n) => supported(n).then_some(n),
+        }
     }
 }
 

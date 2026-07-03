@@ -44,6 +44,7 @@ impl Pipe {
         spv: &[u8],
         binding_count: u32,
         push_size: u32,
+        req_subgroup: Option<u32>,
     ) -> Result<Self> {
         let device = &gpu.device;
 
@@ -72,10 +73,17 @@ impl Pipe {
 
         let module = gpu.create_shader_module(spv)?;
         let entry = std::ffi::CString::new("main").unwrap();
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        // Optionally pin the wavefront size (see `WavePref`). Must outlive the
+        // pipeline-create call, so it is declared here regardless.
+        let mut req_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+            .required_subgroup_size(req_subgroup.unwrap_or(0));
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(&entry);
+        if req_subgroup.is_some() {
+            stage = stage.push_next(&mut req_info);
+        }
         let cp_ci = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(layout);
@@ -145,16 +153,25 @@ fn buffer_info(b: &Buffer) -> [vk::DescriptorBufferInfo; 1] {
 }
 
 impl Miner {
-    pub fn new(gpu: Arc<Gpu>, tps: u32, num_shards: u32, debug: bool) -> Result<Self> {
+    pub fn new(
+        gpu: Arc<Gpu>,
+        tps: u32,
+        num_shards: u32,
+        debug: bool,
+        wave: Option<u32>,
+    ) -> Result<Self> {
         assert!(tps % 64 == 0, "threads-per-shard must be a multiple of 64");
         let device = gpu.device.clone();
 
-        let cn0 = Pipe::new(&gpu, SPV_CN0, 2, std::mem::size_of::<Cn0Push>() as u32)?;
-        let cn00 = Pipe::new(&gpu, SPV_CN00, 2, 0)?;
-        let cn1 = Pipe::new(&gpu, SPV_CN1, 2, 0)?;
-        let cn2 = Pipe::new(&gpu, SPV_CN2, 3, std::mem::size_of::<Cn2Push>() as u32)?;
+        // Only the cross-lane cooperative kernels (cn1/cn2) benefit from a pinned
+        // wavefront; cn0/cn00 have no in-loop barriers, so leave them at the
+        // driver default to avoid constraining their occupancy.
+        let cn0 = Pipe::new(&gpu, SPV_CN0, 2, std::mem::size_of::<Cn0Push>() as u32, None)?;
+        let cn00 = Pipe::new(&gpu, SPV_CN00, 2, 0, None)?;
+        let cn1 = Pipe::new(&gpu, SPV_CN1, 2, 0, wave)?;
+        let cn2 = Pipe::new(&gpu, SPV_CN2, 3, std::mem::size_of::<Cn2Push>() as u32, wave)?;
         let cn2_dbg = if debug {
-            Some(Pipe::new(&gpu, SPV_CN2_DBG, 4, std::mem::size_of::<Cn2Push>() as u32)?)
+            Some(Pipe::new(&gpu, SPV_CN2_DBG, 4, std::mem::size_of::<Cn2Push>() as u32, wave)?)
         } else {
             None
         };
