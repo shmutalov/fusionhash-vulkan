@@ -42,6 +42,17 @@ fn main() {
 
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    println!("cargo:rerun-if-env-changed=CRDIV");
+
+    // Correctly-rounded fp32 divide variant for the cn/gpu core (cn1 / sctest):
+    //   (unset)/markstein -> bit-hack seed + 3 Newton steps (default)
+    //   rcp               -> hardware reciprocal seed + 1 Newton step
+    //   fp64              -> divide in fp64 and round back
+    let crdiv: Vec<&str> = match std::env::var("CRDIV").ok().as_deref() {
+        Some("rcp") => vec!["CRDIV_RCP"],
+        Some("fp64") => vec!["CRDIV_FP64"],
+        _ => vec![],
+    };
 
     let glslc = find_glslc();
 
@@ -82,7 +93,16 @@ fn main() {
 
     for (src_name, out_name) in SHADERS {
         let dst = out_dir.join(out_name);
-        if !compile(&shader_dir.join(src_name), &dst, &[]) {
+        // Only the FP-core shaders divide; the CRDIV define is inert elsewhere.
+        let defines: &[&str] = if matches!(*src_name, "cn1.comp" | "sctest.comp") {
+            &crdiv
+        } else {
+            &[]
+        };
+        if !compile(&shader_dir.join(src_name), &dst, defines) {
+            if !crdiv.is_empty() {
+                panic!("CRDIV={:?} requires glslc to recompile shaders", crdiv);
+            }
             use_prebuilt(out_name, &dst);
         }
     }
