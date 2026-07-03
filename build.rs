@@ -48,11 +48,16 @@ fn main() {
     //   (unset)/rcp -> hardware reciprocal seed + 1 Newton step (default)
     //   markstein   -> bit-hack seed + 3 Newton steps (driver-independent seed)
     //   fp64        -> divide in fp64 and round back
-    let crdiv: Vec<&str> = match std::env::var("CRDIV").ok().as_deref() {
+    let crdiv_env = std::env::var("CRDIV").ok();
+    let crdiv: Vec<&str> = match crdiv_env.as_deref() {
         Some("markstein") => vec![],
         Some("fp64") => vec!["CRDIV_FP64"],
         _ => vec!["CRDIV_RCP"],
     };
+    // The committed prebuilt SPIR-V is built with the default (rcp), so only a
+    // non-default override needs glslc; the default falls back cleanly (e.g. CI
+    // runners without a Vulkan SDK).
+    let needs_glslc = matches!(crdiv_env.as_deref(), Some("markstein") | Some("fp64"));
 
     let glslc = find_glslc();
 
@@ -100,8 +105,12 @@ fn main() {
             &[]
         };
         if !compile(&shader_dir.join(src_name), &dst, defines) {
-            if !crdiv.is_empty() {
-                panic!("CRDIV={:?} requires glslc to recompile shaders", crdiv);
+            if needs_glslc {
+                panic!(
+                    "CRDIV={:?} overrides the default divide but glslc (Vulkan SDK) \
+                     is unavailable to recompile the shaders",
+                    crdiv
+                );
             }
             use_prebuilt(out_name, &dst);
         }

@@ -122,8 +122,10 @@ jobs:
         run: |
           set -euo pipefail
           ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ "${GITHUB_REF_NAME}" != "v${ver}" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${ver}"
+          # Allow a pre-release suffix on the tag (v0.1.2-rc1 -> base v0.1.2).
+          base="${GITHUB_REF_NAME%%-*}"
+          if [ "${base}" != "v${ver}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} (base ${base}) does not match Cargo.toml version v${ver}"
             exit 1
           fi
 
@@ -134,7 +136,13 @@ jobs:
         run: |
           set -euo pipefail
           ls -la dist
+          # A tag with a suffix (e.g. v0.1.2-rc1, -beta) is published as a pre-release.
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in
+            *-*) prerelease="--prerelease" ;;
+          esac
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
+            ${prerelease} \
             dist/*
