@@ -465,7 +465,20 @@ impl Miner {
             device
                 .queue_submit(self.gpu.queue, &[submit], self.fence)
                 .context("queue_submit failed")?;
-            device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+
+            // Wait for the GPU without pegging a CPU core. Some drivers implement
+            // an infinite `vkWaitForFences` as a spin loop, which burns a whole
+            // core for the multi-second duration of a pass. Poll with a zero
+            // timeout and yield the core between checks instead.
+            loop {
+                match device.wait_for_fences(&[self.fence], true, 0) {
+                    Ok(()) => break,
+                    Err(vk::Result::TIMEOUT) => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(e) => return Err(e).context("wait_for_fences failed"),
+                }
+            }
             device.reset_fences(&[self.fence])?;
         }
 
