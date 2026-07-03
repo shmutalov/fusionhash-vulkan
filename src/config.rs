@@ -54,6 +54,13 @@ pub struct Config {
     #[arg(long, default_value_t = 960)]
     pub tps: u32,
 
+    /// Wavefront size for the cooperative kernels (cn1/cn2): "auto" (wave64 on
+    /// AMD, so each cooperative workgroup is a single wave and the barriers are
+    /// free), "driver" (no pinning), "32", or "64". "32"/"driver" are mainly for
+    /// A/B testing the barrier cost.
+    #[arg(long, default_value = "auto")]
+    pub wave: String,
+
     /// Write a JSON stats file periodically (for HiveOS / monitoring).
     #[arg(long, default_value = "")]
     pub stats_file: String,

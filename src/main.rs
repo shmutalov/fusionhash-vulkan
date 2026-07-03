@@ -9,7 +9,7 @@ mod vk;
 use crate::config::Config;
 use crate::miner::{Miner, MEMORY};
 use crate::stratum::{MockPool, Pool, StratumPool};
-use crate::vk::{Gpu, Instance, PhysicalDevice};
+use crate::vk::{Gpu, Instance, PhysicalDevice, WavePref};
 use anyhow::{bail, Result};
 use clap::Parser;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
         println!("Available Vulkan compute devices:");
         for (i, d) in devices.iter().enumerate() {
             println!(
-                "[{}] {} (vendor=0x{:04x} device=0x{:04x} VRAM={:.1} GiB CUs={} subgroup={} driver={})",
+                "[{}] {} (vendor=0x{:04x} device=0x{:04x} VRAM={:.1} GiB CUs={} subgroup={} range={}..={} ctrl={} driver={})",
                 i + 1,
                 d.name,
                 d.vendor_id,
@@ -41,6 +41,9 @@ fn main() -> Result<()> {
                 d.device_local_mem as f64 / (1u64 << 30) as f64,
                 d.compute_units,
                 d.subgroup_size,
+                d.min_subgroup_size,
+                d.max_subgroup_size,
+                d.subgroup_size_control,
                 d.driver_info,
             );
         }
@@ -67,7 +70,8 @@ fn main() -> Result<()> {
 
     if cfg.selftest {
         let gpu = Gpu::new(instance.clone(), chosen[0].clone())?;
-        return selftest::run(gpu, 64);
+        let wave = resolve_wave(&gpu, &cfg.wave);
+        return selftest::run(gpu, 64, wave);
     }
 
     // Pool.
@@ -91,16 +95,18 @@ fn main() -> Result<()> {
         }
         let gpu = Gpu::new(instance.clone(), pd.clone())?;
         let num_shards = compute_shards(&cfg, pd);
-        let miner = Miner::new(gpu, cfg.tps, num_shards, false)?;
+        let wave = resolve_wave(&gpu, &cfg.wave);
+        let miner = Miner::new(gpu, cfg.tps, num_shards, false, wave)?;
         let total = miner.hashes_per_iter();
         log::info!(
-            "device [{}] {}: tps={} shards={} threads={} scratch={:.2} GiB",
+            "device [{}] {}: tps={} shards={} threads={} scratch={:.2} GiB wave={}",
             idx + 1,
             pd.name,
             cfg.tps,
             num_shards,
             total,
             (MEMORY * total) as f64 / (1u64 << 30) as f64,
+            wave.map_or_else(|| "driver".to_string(), |w| w.to_string()),
         );
 
         let hr = Arc::new(AtomicU64::new(0));
@@ -171,6 +177,33 @@ fn write_stats(path: &str, reporters: &[Reporter], uptime: u64, accepted: u64, r
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
+}
+
+/// Turn the `--wave` string into a concrete required subgroup size for cn1/cn2,
+/// warning if a forced size cannot be honoured by the device.
+fn resolve_wave(gpu: &Gpu, s: &str) -> Option<u32> {
+    let pref = match s.trim() {
+        "" | "auto" => WavePref::Auto,
+        // Explicitly leave the driver to choose (no required size pinned).
+        "driver" | "off" | "none" => return None,
+        "32" => WavePref::Force(32),
+        "64" => WavePref::Force(64),
+        other => {
+            log::warn!("invalid --wave '{other}' (expected auto|driver|32|64), using auto");
+            WavePref::Auto
+        }
+    };
+    let resolved = gpu.required_subgroup_size(pref);
+    if let (WavePref::Force(n), None) = (pref, resolved) {
+        log::warn!(
+            "--wave {n} not supported on {} (subgroup range {}..={}, control={}); using driver default",
+            gpu.pdev.name,
+            gpu.pdev.min_subgroup_size,
+            gpu.pdev.max_subgroup_size,
+            gpu.pdev.subgroup_size_control,
+        );
+    }
+    resolved
 }
 
 fn compute_shards(cfg: &Config, pd: &PhysicalDevice) -> u32 {

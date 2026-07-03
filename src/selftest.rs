@@ -8,12 +8,15 @@ use crate::vk::Gpu;
 use anyhow::Result;
 use std::sync::Arc;
 
-pub fn run(gpu: Arc<Gpu>, lanes: usize) -> Result<()> {
+pub fn run(gpu: Arc<Gpu>, lanes: usize, wave: Option<u32>) -> Result<()> {
     let tps = 64u32;
     let name = gpu.pdev.name.clone();
-    log::info!("running self-test on {name} (tps={tps})");
+    log::info!(
+        "running self-test on {name} (tps={tps}, wave={})",
+        wave.map_or_else(|| "driver".to_string(), |w| w.to_string()),
+    );
 
-    let mut miner = Miner::new(gpu, tps, 1, true)?;
+    let mut miner = Miner::new(gpu, tps, 1, true, wave)?;
 
     let mut input = [0u8; 128];
     for i in 0..76 {
