@@ -110,13 +110,36 @@ vec4 fp_or(vec4 a, uint m)  { return uintBitsToFloat(floatBitsToUint(a) | uvec4(
 //     the self-test / micro-test).
 //   * CRDIV_FP64: divide in fp64 and round back (correctly rounded by
 //     construction, ~10% slower on RDNA3). Kept as a reference/fallback.
-#ifdef CRDIV_FP64
+//   * CRDIV_RCP: seed the reciprocal from the hardware divide (`1.0/|b|`, one
+//     v_rcp, <=2.5 ULP) instead of the 8-bit integer bit-hack, so a single
+//     Newton step reaches the same ~0.5-ULP reciprocal that the bit-hack seed
+//     needs three steps for. Same final correctly-rounded quotient (the Markstein
+//     residual correction pins it regardless of seed), but ~4 fewer FMAs and it
+//     offloads the seed onto the transcendental unit — which helps when the FP32
+//     ALU is the bottleneck (RDNA1/2). Validate with --microtest / --selftest.
+#if defined(CRDIV_FP64)
 vec4 crdiv(vec4 a, vec4 b) {
     return vec4(
         float(double(a.x) / double(b.x)),
         float(double(a.y) / double(b.y)),
         float(double(a.z) / double(b.z)),
         float(double(a.w) / double(b.w)));
+}
+#elif defined(CRDIV_RCP)
+vec4 crdiv(vec4 a, vec4 b) {
+    vec4 ab = abs(b);
+    // Hardware reciprocal seed (<=2.5 ULP) + one Newton-Raphson step. From a
+    // ~22-bit seed one step reaches the fp32 rounding floor, matching the 8-bit
+    // seed's three-step result.
+    vec4 y = vec4(1.0) / ab;
+    vec4 e = fma(-ab, y, vec4(1.0)); y = fma(y, e, y);
+    // Apply the divisor's sign: rb = 1/b.
+    vec4 rb = uintBitsToFloat(floatBitsToUint(y) | (floatBitsToUint(b) & uvec4(0x80000000u)));
+    // Quotient + FMA residual correction -> correctly rounded a/b.
+    vec4 q = a * rb;
+    vec4 r = fma(-b, q, a);
+    q = fma(r, rb, q);
+    return q;
 }
 #else
 vec4 crdiv(vec4 a, vec4 b) {

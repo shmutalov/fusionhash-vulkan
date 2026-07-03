@@ -101,9 +101,26 @@ mis-mapped target cannot produce a rejected share, only a missed one.
 * `--tps` is capped by the 2 GiB max-allocation limit (960 lanes ≈ 1.9 GiB).
 * More shards is not always faster: the card saturates around 3–5 shards and then
   becomes power/thermal-bound (8 shards is slower than 5).
-* The divide uses a correctly-rounded Markstein `fp32` method by default; build
-  with `-DCRDIV_FP64` (via `glslc`) to fall back to the `fp64` divide, which is
-  ~9% slower but also correctly rounded.
+* The correctly-rounded fp32 divide has three variants, selected at build time
+  with the `CRDIV` env var (all bit-exact — verified by `--microtest` /
+  `--selftest`):
+  * `CRDIV=markstein` (default) — bit-hack reciprocal seed + 3 Newton steps. The
+    seed is driver-independent (a pure integer op), so it needs no guarantees
+    from the driver's `OpFDiv`.
+  * `CRDIV=rcp` — seed the reciprocal from the hardware divide (`1.0/|b|`, one
+    `v_rcp`, ≤2.5 ULP) and do a single Newton step. One step from a ~22-bit seed
+    reaches the same fp32 rounding floor the bit-hack needs three for, so the
+    Markstein residual correction still pins the correctly-rounded quotient on any
+    conformant driver. ~4 fewer FMAs and it offloads the seed onto the
+    transcendental unit; measured **+2.4 % on a 7900 XT** (larger gains expected
+    where the FP32 ALU is the bottleneck, i.e. RDNA1/2). Validate with
+    `--selftest` on the target card before shipping.
+  * `CRDIV=fp64` — divide in fp64 and round back; ~9 % slower on RDNA3 and far
+    slower on cards with 1/16-rate fp64 (RDNA1/2). Reference/fallback only.
+* Cooperative-kernel wavefront size is pinned with `--wave auto|driver|32|64`
+  (`auto` = wave64 on AMD, so each cn1/cn2 workgroup is a single wave and its
+  barriers are free). On a 7900 XT `auto` matches the driver default; `32` is for
+  A/B testing the barrier cost.
 
 ## License
 
