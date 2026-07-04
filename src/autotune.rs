@@ -9,8 +9,10 @@
 //! fp32 fma, which silently breaks both fp32 divide variants by 1 ULP), and
 //! that is a property of the installed driver build, not of the GPU name.
 
+use crate::config::Config;
 use crate::microtest;
-use crate::vk::Gpu;
+use crate::miner::MEMORY;
+use crate::vk::{Gpu, PhysicalDevice};
 use anyhow::{bail, Result};
 use std::sync::Arc;
 
@@ -67,6 +69,69 @@ impl Crdiv {
             _ => None,
         }
     }
+}
+
+/// Lane density the layout solver aims for: 48 in-flight hashes per CU
+/// (xmr-stak's GCN-profiled optimum, 6 waves × worksize 8; also within a few
+/// percent of the measured RDNA3 sweet spot).
+const LANES_PER_CU: f64 = 48.0;
+/// Preferred threads-per-shard. Kept as the starting point so devices with
+/// enough VRAM (e.g. the validated 5×960 on a 7900 XT) resolve exactly as the
+/// previous fixed default did.
+const DEFAULT_TPS: u32 = 960;
+/// Fraction of device-local VRAM the scratchpads may occupy.
+const VRAM_BUDGET: f64 = 0.80;
+
+/// Resolve threads-per-shard and shard count for one device.
+///
+/// `--tps`/`--shards` (nonzero) force their respective values. In auto mode
+/// the solver starts from `DEFAULT_TPS` and only shrinks tps (in steps of 64)
+/// when the per-shard granularity would starve the CU-based lane target —
+/// e.g. a 4 GiB RX 570 fits only 1×960 lanes at the default, but 2×768 hits
+/// the 1536-lane target exactly.
+pub fn select_layout(cfg: &Config, pd: &PhysicalDevice) -> (u32, u32) {
+    let cu = if pd.compute_units > 0 { pd.compute_units } else { 32 };
+    let target = (cu as f64 * LANES_PER_CU * cfg.intensity).max(64.0);
+
+    let shards_for = |tps: u32| -> u32 {
+        let max_by_mem =
+            (pd.device_local_mem as f64 * VRAM_BUDGET / (MEMORY * tps as u64) as f64) as u32;
+        let desired = (target / tps as f64).round() as u32;
+        desired.clamp(1, max_by_mem.max(1))
+    };
+
+    // Forced tps: legacy behaviour (shards from the CU formula unless forced).
+    if cfg.tps > 0 {
+        let shards = if cfg.shards > 0 { cfg.shards } else { shards_for(cfg.tps) };
+        return (cfg.tps, shards);
+    }
+
+    // Largest tps the device's max allocation permits, in units of 64.
+    let max_tps_alloc = (((pd.max_alloc / MEMORY) as u32) / 64 * 64).max(64);
+    let tps0 = DEFAULT_TPS.min(max_tps_alloc);
+    let shards0 = if cfg.shards > 0 { cfg.shards } else { shards_for(tps0) };
+    let lanes0 = tps0 * shards0;
+    // Close enough to the target (or shards forced): keep the default tps.
+    if cfg.shards > 0 || lanes0 as f64 >= target * 0.95 {
+        return (tps0, shards0);
+    }
+
+    // Starved: search smaller tps for the layout closest to the target from
+    // below (score = min(lanes, target); overshoot beyond the target is not
+    // rewarded). Ties keep the larger tps (fewer shards).
+    let score = |lanes: u32| (lanes as f64).min(target);
+    let (mut best, mut best_score) = ((tps0, shards0), score(lanes0));
+    let mut tps = tps0;
+    while tps > 64 {
+        tps -= 64;
+        let shards = shards_for(tps);
+        let s = score(tps * shards);
+        if s > best_score {
+            best = (tps, shards);
+            best_score = s;
+        }
+    }
+    best
 }
 
 /// Records for the startup validation. The observed failure modes are dense

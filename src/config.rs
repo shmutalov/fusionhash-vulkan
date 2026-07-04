@@ -49,9 +49,11 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub shards: u32,
 
-    /// Threads per shard (multiple of 64, <= ~1000 to stay under the 2 GiB
-    /// allocation limit).
-    #[arg(long, default_value_t = 960)]
+    /// Threads per shard (multiple of 64). 0 = auto: solved jointly with the
+    /// shard count from the device's CU count, VRAM and max allocation
+    /// (starts at 960 and shrinks only when a small-VRAM card would otherwise
+    /// fall short of the per-CU lane target).
+    #[arg(long, default_value_t = 0)]
     pub tps: u32,
 
     /// Correctly-rounded divide variant for the FP core: "auto" (validate each
