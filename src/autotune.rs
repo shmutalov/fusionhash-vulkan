@@ -71,10 +71,19 @@ impl Crdiv {
     }
 }
 
-/// Lane density the layout solver aims for: 48 in-flight hashes per CU
-/// (xmr-stak's GCN-profiled optimum, 6 waves × worksize 8; also within a few
-/// percent of the measured RDNA3 sweet spot).
-const LANES_PER_CU: f64 = 48.0;
+/// Lane density the layout solver aims for, per architecture.
+/// GCN (wave64-only): 48/CU — xmr-stak's profiled optimum (6 waves ×
+/// worksize 8). RDNA (wave32-capable, i.e. min subgroup size 32): 70/CU —
+/// measured on a 7900 XT with the sliced cn1 pipeline, where 7×960 (6720
+/// lanes, 70/CU) does ~6.62 kH/s vs ~6.18 at the old 48/CU target; the
+/// earlier "saturates at 3–5 shards" observation predates the slicing.
+fn lanes_per_cu(pd: &PhysicalDevice) -> f64 {
+    if pd.min_subgroup_size == 32 {
+        70.0
+    } else {
+        48.0
+    }
+}
 /// Preferred threads-per-shard. Kept as the starting point so devices with
 /// enough VRAM (e.g. the validated 5×960 on a 7900 XT) resolve exactly as the
 /// previous fixed default did.
@@ -91,7 +100,7 @@ const VRAM_BUDGET: f64 = 0.80;
 /// the 1536-lane target exactly.
 pub fn select_layout(cfg: &Config, pd: &PhysicalDevice) -> (u32, u32) {
     let cu = if pd.compute_units > 0 { pd.compute_units } else { 32 };
-    let target = (cu as f64 * LANES_PER_CU * cfg.intensity).max(64.0);
+    let target = (cu as f64 * lanes_per_cu(pd) * cfg.intensity).max(64.0);
 
     let shards_for = |tps: u32| -> u32 {
         let max_by_mem =

@@ -108,8 +108,11 @@ mis-mapped target cannot produce a rejected share, only a missed one.
 ## Tuning notes for RDNA3
 
 * `--tps` is capped by the 2 GiB max-allocation limit (960 lanes ≈ 1.9 GiB).
-* More shards is not always faster: the card saturates around 3–5 shards and then
-  becomes power/thermal-bound (8 shards is slower than 5).
+  Both tps and shards default to auto: the solver targets 70 in-flight
+  hashes/CU on RDNA (measured: 7 shards ≈ 6.6 kH/s vs 5 ≈ 6.2 on a 7900 XT
+  with the sliced cn1 pipeline) and 48/CU on GCN, within 80 % of VRAM.
+* More shards is still not always faster — the 7900 XT peaks at 7 and dips at
+  8 (power/thermal-bound).
 * The correctly-rounded fp32 divide has three variants; **all are embedded in
   the binary and the right one is picked per device at startup**
   ([`src/autotune.rs`](src/autotune.rs)): each candidate is validated
