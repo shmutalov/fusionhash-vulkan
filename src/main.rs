@@ -1,3 +1,4 @@
+mod autotune;
 mod cnhash;
 mod config;
 mod microtest;
@@ -71,7 +72,8 @@ fn main() -> Result<()> {
     if cfg.selftest {
         let gpu = Gpu::new(instance.clone(), chosen[0].clone())?;
         let wave = resolve_wave(&gpu, &cfg.wave);
-        return selftest::run(gpu, 64, wave);
+        let crdiv = autotune::select_crdiv(&gpu, &cfg.crdiv)?;
+        return selftest::run(gpu, 64, wave, crdiv);
     }
 
     // Pool.
@@ -85,28 +87,48 @@ fn main() -> Result<()> {
     // Spin up a miner thread per device.
     let mut reporters: Vec<Reporter> = Vec::new();
     for (idx, pd) in chosen.iter().enumerate() {
-        if MEMORY * cfg.tps as u64 > pd.max_alloc {
+        let (tps, formula_shards) = autotune::select_layout(&cfg, pd);
+        if MEMORY * tps as u64 > pd.max_alloc {
             bail!(
                 "tps={} needs {} MiB/shard which exceeds the device max allocation of {} MiB; lower --tps",
-                cfg.tps,
-                MEMORY * cfg.tps as u64 / (1024 * 1024),
+                tps,
+                MEMORY * tps as u64 / (1024 * 1024),
                 pd.max_alloc / (1024 * 1024)
             );
         }
         let gpu = Gpu::new(instance.clone(), pd.clone())?;
-        let num_shards = compute_shards(&cfg, pd);
         let wave = resolve_wave(&gpu, &cfg.wave);
-        let miner = Miner::new(gpu, cfg.tps, num_shards, false, wave)?;
+        let crdiv = autotune::select_crdiv(&gpu, &cfg.crdiv)?;
+        let num_shards = if cfg.tune && cfg.shards == 0 {
+            let shards = autotune::tune_shards(&gpu, &cfg, tps, formula_shards, wave, crdiv)?;
+            log::info!(
+                "device [{}] {}: tuned — to skip auto-tuning next time, run with: \
+                 --tune=false --tps {} --shards {} --crdiv {}",
+                idx + 1,
+                pd.name,
+                tps,
+                shards,
+                crdiv.name(),
+            );
+            shards
+        } else {
+            formula_shards
+        };
+        let miner = Miner::new(gpu, tps, num_shards, false, wave, cfg.cn1_slices, crdiv)?;
         let total = miner.hashes_per_iter();
         log::info!(
-            "device [{}] {}: tps={} shards={} threads={} scratch={:.2} GiB wave={}",
+            "device [{}] {}: tps={}{} shards={} threads={} scratch={:.2} GiB wave={} divide={} cn1_slices={}{}",
             idx + 1,
             pd.name,
-            cfg.tps,
+            tps,
+            if cfg.tps == 0 { " (auto)" } else { "" },
             num_shards,
             total,
             (MEMORY * total) as f64 / (1u64 << 30) as f64,
             wave.map_or_else(|| "driver".to_string(), |w| w.to_string()),
+            crdiv.name(),
+            miner.cn1_slices(),
+            if cfg.cn1_slices == 0 { " (auto)" } else { "" },
         );
 
         let hr = Arc::new(AtomicU64::new(0));
@@ -206,17 +228,6 @@ fn resolve_wave(gpu: &Gpu, s: &str) -> Option<u32> {
     resolved
 }
 
-fn compute_shards(cfg: &Config, pd: &PhysicalDevice) -> u32 {
-    if cfg.shards > 0 {
-        return cfg.shards;
-    }
-    let per_shard = MEMORY * cfg.tps as u64;
-    let max_by_mem = ((pd.device_local_mem as f64 * 0.80) / per_shard as f64) as u32;
-    let cu = if pd.compute_units > 0 { pd.compute_units } else { 32 };
-    let desired_threads = (cu as f64 * 48.0 * cfg.intensity).max(cfg.tps as f64);
-    let desired_shards = (desired_threads / cfg.tps as f64).round() as u32;
-    desired_shards.clamp(1, max_by_mem.max(1))
-}
 
 fn mine_loop(mut miner: Miner, pool: Arc<dyn Pool>, hashrate: Arc<AtomicU64>, dev: usize) -> Result<()> {
     let per_iter = miner.hashes_per_iter();

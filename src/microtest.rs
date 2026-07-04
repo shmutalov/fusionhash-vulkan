@@ -1,13 +1,16 @@
-//! Isolated GPU-vs-CPU comparison of `single_compute` (the cn/gpu FP core),
-//! so a rounding divergence can be bisected without the full pipeline.
+//! Isolated GPU-vs-CPU comparison of `single_compute` (the cn/gpu FP core).
+//! Two consumers:
+//!   * `validate` — short, silent pass used by `autotune` to pick the divide
+//!     variant per device at startup;
+//!   * `run` — the `--microtest` diagnostic, which reports every variant so a
+//!     rounding divergence can be bisected without the full pipeline.
 
+use crate::autotune::Crdiv;
 use crate::cnhash;
 use crate::vk::{as_bytes, Gpu};
 use anyhow::Result;
 use ash::vk;
 use std::sync::Arc;
-
-const SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sctest.comp.spv"));
 
 struct Xorshift(u64);
 impl Xorshift {
@@ -24,7 +27,43 @@ impl Xorshift {
     }
 }
 
+/// True when `single_compute` with this divide variant matches the CPU
+/// reference bit-for-bit over `count` records on this device.
+pub fn validate(gpu: &Arc<Gpu>, crdiv: Crdiv, count: usize) -> Result<bool> {
+    let (sum_mismatch, int_mismatch) = compare(gpu, crdiv.sctest_spv(), count, false)?;
+    Ok(sum_mismatch == 0 && int_mismatch == 0)
+}
+
+/// `--microtest`: compare every divide variant and report. Fails only when no
+/// variant is bit-exact on this device.
 pub fn run(gpu: Arc<Gpu>, count: usize) -> Result<()> {
+    let mut exact = Vec::new();
+    for crdiv in Crdiv::ALL {
+        if crdiv == Crdiv::Fp64 && !gpu.pdev.shader_float64 {
+            log::warn!("divide={}: skipped (no shaderFloat64)", crdiv.name());
+            continue;
+        }
+        let (sums, ints) = compare(&gpu, crdiv.sctest_spv(), count, true)?;
+        if sums == 0 && ints == 0 {
+            log::info!("divide={}: {count} records, bit-exact", crdiv.name());
+            exact.push(crdiv.name());
+        } else {
+            log::error!(
+                "divide={}: {count} records, sum mismatches={sums}, int mismatches={ints}",
+                crdiv.name()
+            );
+        }
+    }
+    if exact.is_empty() {
+        anyhow::bail!("single_compute diverges for every divide variant")
+    }
+    log::info!("bit-exact divide variants on {}: {}", gpu.pdev.name, exact.join(", "));
+    Ok(())
+}
+
+/// Run `single_compute` on the GPU with the given sctest SPIR-V and count the
+/// records whose outputs differ from the CPU reference.
+fn compare(gpu: &Arc<Gpu>, spv: &[u8], count: usize, verbose: bool) -> Result<(usize, usize)> {
     let device = gpu.device.clone();
 
     // Generate records.
@@ -87,7 +126,7 @@ pub fn run(gpu: Arc<Gpu>, count: usize) -> Result<()> {
             None,
         )
     }?;
-    let module = gpu.create_shader_module(SPV)?;
+    let module = gpu.create_shader_module(spv)?;
     let entry = std::ffi::CString::new("main").unwrap();
     let stage = vk::PipelineShaderStageCreateInfo::default()
         .stage(vk::ShaderStageFlags::COMPUTE)
@@ -193,7 +232,7 @@ pub fn run(gpu: Arc<Gpu>, count: usize) -> Result<()> {
         if int_bad {
             int_mismatch += 1;
         }
-        if (sum_bad || int_bad) && shown < 6 {
+        if verbose && (sum_bad || int_bad) && shown < 6 {
             shown += 1;
             log::error!("record {i}: cnt={cnt} rnd_c={rnd_c:?}");
             log::error!("  cpu sum bits = {:08x?}", cpu_sum.map(|x| x.to_bits()));
@@ -218,15 +257,7 @@ pub fn run(gpu: Arc<Gpu>, count: usize) -> Result<()> {
         gpu.destroy_buffer(b);
     }
 
-    log::info!(
-        "microtest: {count} records, sum mismatches={sum_mismatch}, int mismatches={int_mismatch}"
-    );
-    if sum_mismatch == 0 && int_mismatch == 0 {
-        log::info!("single_compute matches bit-exactly");
-        Ok(())
-    } else {
-        anyhow::bail!("single_compute diverges")
-    }
+    Ok((sum_mismatch, int_mismatch))
 }
 
 fn cnhash_ccnt(i: usize) -> f32 {

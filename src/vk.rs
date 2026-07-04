@@ -88,6 +88,11 @@ pub struct PhysicalDevice {
     /// `subgroupSizeControl` feature is available *and* the compute stage is in
     /// `requiredSubgroupSizeStages` — i.e. we may pin a required size on cn1/cn2.
     pub subgroup_size_control: bool,
+    /// Device supports fp64 math (needed only by the fp64 divide variant;
+    /// enabled at device creation when present so autotune may select it).
+    pub shader_float64: bool,
+    /// Device supports int64 math (required by all kernels — Keccak state).
+    pub shader_int64: bool,
     pub driver_info: String,
     pub pci_bus: u32,
 }
@@ -129,6 +134,8 @@ impl PhysicalDevice {
         let mut ssc_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
         let mut feats2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut ssc_feat);
         unsafe { instance.get_physical_device_features2(handle, &mut feats2) };
+        let shader_float64 = feats2.features.shader_float64 == vk::TRUE;
+        let shader_int64 = feats2.features.shader_int64 == vk::TRUE;
         let subgroup_size_control = ssc_feat.subgroup_size_control == vk::TRUE
             && ssc_props
                 .required_subgroup_size_stages
@@ -167,6 +174,8 @@ impl PhysicalDevice {
             min_subgroup_size: ssc_props.min_subgroup_size,
             max_subgroup_size: ssc_props.max_subgroup_size,
             subgroup_size_control,
+            shader_float64,
+            shader_int64,
             driver_info,
             pci_bus: pci.pci_bus,
         }
@@ -214,9 +223,18 @@ impl Gpu {
             .queue_priorities(&priorities);
         let qcis = [qci];
 
+        // shaderInt64 is required by every kernel (Keccak state); fail with a
+        // clear message rather than an opaque FEATURE_NOT_PRESENT. shaderFloat64
+        // is only needed by the fp64 divide variant — enable it when supported
+        // so autotune may pick that variant, skip it otherwise.
+        if !pdev.shader_int64 {
+            anyhow::bail!("{} has no shaderInt64 support — cannot run cn/gpu", pdev.name);
+        }
         let mut features = vk::PhysicalDeviceFeatures::default();
         features.shader_int64 = vk::TRUE;
-        features.shader_float64 = vk::TRUE;
+        if pdev.shader_float64 {
+            features.shader_float64 = vk::TRUE;
+        }
 
         // Enable subgroupSizeControl when available so cn1/cn2 can pin their
         // wavefront size (see `WavePref`). Enabling a supported feature is inert

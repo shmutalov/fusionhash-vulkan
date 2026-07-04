@@ -6,16 +6,40 @@
 // cn1: the cn/gpu memory-hard core. 16 lanes cooperate per hash. Each of the
 // ITERATIONS rounds runs the FP32 "single_compute" mixing function and folds
 // the result back into the scratchpad. This is the bit-exact hot loop.
+//
+// The host dispatches this kernel in slices of `iter_count` iterations rather
+// than all ITERATIONS at once: a single dispatch that runs for seconds cannot
+// be preempted and trips the Windows TDR watchdog (~2 s) on slower GPUs. The
+// per-hash loop state that survives a slice boundary is just `s` and `vs`
+// (the scratchpad itself already lives in VRAM); it is saved to / restored
+// from the Save buffer, so the split is bit-exact — the same operations run
+// in the same order.
 
 const uint CN1_CHUNKS = 4u;                 // hashes per workgroup
 layout(local_size_x = 16u * CN1_CHUNKS) in; // 64 invocations
 
+struct SaveSlot {
+    vec4 vs;
+    uint s;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
 layout(std430, binding = 0) buffer Scratch { int data[]; } spad;      // scratchpad, 32-bit view
 layout(std430, binding = 1) readonly buffer States { uint64_t st[]; } states;
+layout(std430, binding = 2) buffer Save { SaveSlot slot[]; } save;    // per-hash slice-resume state
+
+layout(push_constant) uniform Push {
+    uint iter_start; // 0 = first slice (init from states), else resume from Save
+    uint iter_count; // iterations to run in this dispatch
+} pc;
 
 const uint MEMORY = 2097152u;
 const uint MASK   = 0x1FFFC0u;
 const uint MEM_I32 = MEMORY / 4u;     // 32-bit words per lane
+// Total iterations per hash across all slices; the host's slice `iter_count`s
+// must sum to exactly this (CN1_ITERATIONS in miner.rs).
 const uint ITERATIONS = 49152u;
 
 // 64 ints / 64 floats per chunk aliasing the reference `SharedMemChunk`.
@@ -43,14 +67,21 @@ void main() {
     uint base    = chunk * 64u;
     uint lpad_base = MEM_I32 * idxHash;
 
-    uint s = uint(states.st[idxHash * 25u]) >> 8u;   // low 32 bits of State[0], >> 8
-    vec4 vs = vec4(0.0);
+    uint s;
+    vec4 vs;
+    if (pc.iter_start == 0u) {
+        s  = uint(states.st[idxHash * 25u]) >> 8u;   // low 32 bits of State[0], >> 8
+        vs = vec4(0.0);
+    } else {
+        s  = save.slot[idxHash].s;
+        vs = save.slot[idxHash].vs;
+    }
 
     uint tidd  = tid / 4u;
     uint tidm  = tid % 4u;
     uint block = tidd * 16u + tidm;
 
-    for (uint it = 0u; it < ITERATIONS; ++it) {
+    for (uint it = 0u; it < pc.iter_count; ++it) {
         barrier();
         uint sp_idx = lpad_base + ((s & MASK) >> 2u) + tidd * 4u + tidm;
         int tmp = spad.data[sp_idx];
@@ -99,5 +130,12 @@ void main() {
 
         vs = vec4(sva[base], sva[base + 1u], sva[base + 2u], sva[base + 3u]);
         s = uint(sout[base] ^ sout[base + 1u] ^ sout[base + 2u] ^ sout[base + 3u]);
+    }
+
+    // Persist the slice-carried state (all 16 lanes hold identical copies;
+    // one write per hash suffices). Raw bit copy, so the resume is exact.
+    if (tid == 0u) {
+        save.slot[idxHash].s  = s;
+        save.slot[idxHash].vs = vs;
     }
 }

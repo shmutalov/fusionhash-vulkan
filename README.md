@@ -56,6 +56,15 @@ holding `--tps` lanes (default 960 ≈ 1.9 GiB). Several shards run per dispatch
 stage-major, so they overlap on the queue. On a 7900 XT the default (intensity 1)
 uses 5 shards / 4800 lanes at ~5.9 kH/s.
 
+The cn1 stage is dispatched in slices (`--cn1-slices`, default auto) rather
+than as one 49152-iteration dispatch: a dispatch that runs for seconds cannot
+be preempted, and Windows' TDR watchdog resets the GPU (`VK_ERROR_DEVICE_LOST`)
+after ~2 s — which is exactly what happens on slower cards (e.g. an RX 580
+needs ~2.5 s per pass). Each hash's tiny resume state (`s` + `vs`, 32 B) is
+persisted between slices, so the split is bit-exact and costs nothing
+measurable (~48 ms/slice on a 7900 XT). Auto starts at 16 slices and doubles
+whenever a slice exceeds ~200 ms.
+
 ## Build
 
 Requires the Vulkan SDK (for `glslc`, which `build.rs` invokes) and Rust ≥ 1.75.
@@ -85,8 +94,10 @@ vulkminer --shards 5 --tps 960
 ```
 
 Flags: `--pool --user --pass`, `--devices/-d`, `--intensity`, `--shards`,
-`--tps`, `--all` (include non-AMD/NVIDIA devices), `--info`, `--mock`,
-`--selftest`, `--microtest`.
+`--tps`, `--tune` (default true: measure shard candidates at startup, cached
+per device in `~/.vulkminer-tune.json`; `--tune=false` uses the formula only),
+`--crdiv`, `--cn1-slices`, `--all` (include non-AMD/NVIDIA devices), `--info`,
+`--mock`, `--selftest`, `--microtest`.
 
 ## Pool protocol
 
@@ -99,23 +110,33 @@ mis-mapped target cannot produce a rejected share, only a missed one.
 ## Tuning notes for RDNA3
 
 * `--tps` is capped by the 2 GiB max-allocation limit (960 lanes ≈ 1.9 GiB).
-* More shards is not always faster: the card saturates around 3–5 shards and then
-  becomes power/thermal-bound (8 shards is slower than 5).
-* The correctly-rounded fp32 divide has three variants, selected at build time
-  with the `CRDIV` env var (all bit-exact — verified by `--microtest` /
-  `--selftest`):
-  * `CRDIV=rcp` (default) — seed the reciprocal from the hardware divide
-    (`1.0/|b|`, one `v_rcp`, ≤2.5 ULP) and do a single Newton step. One step from
-    a ~22-bit seed reaches the same fp32 rounding floor the bit-hack needs three
-    for, so the Markstein residual correction still pins the correctly-rounded
-    quotient on any conformant driver. ~4 fewer FMAs and it offloads the seed onto
-    the transcendental unit; measured **+2.4 % on a 7900 XT** (larger gains
-    expected where the FP32 ALU is the bottleneck, i.e. RDNA1/2).
-  * `CRDIV=markstein` — bit-hack reciprocal seed + 3 Newton steps. The seed is
+  Both tps and shards default to auto: the solver targets 70 in-flight
+  hashes/CU on RDNA (measured: 7 shards ≈ 6.6 kH/s vs 5 ≈ 6.2 on a 7900 XT
+  with the sliced cn1 pipeline) and 48/CU on GCN, within 80 % of VRAM.
+* More shards is still not always faster — the 7900 XT peaks at 7 and dips at
+  8 (power/thermal-bound).
+* The correctly-rounded fp32 divide has three variants; **all are embedded in
+  the binary and the right one is picked per device at startup**
+  ([`src/autotune.rs`](src/autotune.rs)): each candidate is validated
+  bit-for-bit against the CPU reference over 16k `single_compute` records
+  (~100 ms) and the fastest exact one wins. `--crdiv rcp|markstein|fp64`
+  forces a variant (still validated — a diverging divide can never produce an
+  accepted share); `--microtest` reports the status of all three on a device.
+  * `rcp` — seed the reciprocal from the hardware divide (`1.0/|b|`, one
+    `v_rcp`, ≤2.5 ULP) and do a single Newton step; the Markstein residual
+    correction pins the correctly-rounded quotient. Measured **+2.4 % on a
+    7900 XT**; the auto-selection default everywhere it validates.
+  * `markstein` — bit-hack reciprocal seed + 3 Newton steps. The seed is
     driver-independent (a pure integer op), so it needs no guarantees from the
-    driver's `OpFDiv` — the conservative fallback if a driver's divide misbehaves.
-  * `CRDIV=fp64` — divide in fp64 and round back; ~9 % slower on RDNA3 and far
-    slower on cards with 1/16-rate fp64 (RDNA1/2). Reference/fallback only.
+    driver's `OpFDiv` lowering.
+  * `fp64` — divide in fp64 and round back. Slow (1/16-rate fp64 on GCN) but
+    the only variant that does not require the driver to emit *fused* fp32
+    fmas. This matters in practice: **Mesa/ACO on GCN (e.g. RADV on an
+    RX 570/580) never fuses `fma()`** — neither `precise` nor a
+    `NoContraction` decoration changes that — which silently breaks both fp32
+    variants by 1 ULP on ~44 % of divides. Auto-selection lands here on
+    those drivers (measured ~0.45 kH/s vs ~0.7 fp32-theoretical on an
+    RX 570).
 * Cooperative-kernel wavefront size is pinned with `--wave auto|driver|32|64`
   (`auto` = wave64 on AMD, so each cn1/cn2 workgroup is a single wave and its
   barriers are free). On a 7900 XT `auto` matches the driver default; `32` is for

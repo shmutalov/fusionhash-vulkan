@@ -49,10 +49,35 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub shards: u32,
 
-    /// Threads per shard (multiple of 64, <= ~1000 to stay under the 2 GiB
-    /// allocation limit).
-    #[arg(long, default_value_t = 960)]
+    /// Threads per shard (multiple of 64). 0 = auto: solved jointly with the
+    /// shard count from the device's CU count, VRAM and max allocation
+    /// (starts at 960 and shrinks only when a small-VRAM card would otherwise
+    /// fall short of the per-CU lane target).
+    #[arg(long, default_value_t = 0)]
     pub tps: u32,
+
+    /// Measure candidate shard counts at startup (one warm-up + 2 timed full
+    /// passes each, hill-climbing from the computed target) and keep the
+    /// fastest. Results are cached per device/driver/version/config in
+    /// ~/.vulkminer-tune.json, so only the first launch pays the sweep.
+    /// Disable with --tune=false; a forced --shards also skips it.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+          num_args = 0..=1, default_missing_value = "true")]
+    pub tune: bool,
+
+    /// Correctly-rounded divide variant for the FP core: "auto" (validate each
+    /// variant on the device at startup and keep the fastest bit-exact one),
+    /// "rcp", "markstein" or "fp64". Forced variants are still validated —
+    /// a diverging divide can never produce an accepted share.
+    #[arg(long, default_value = "auto")]
+    pub crdiv: String,
+
+    /// cn1 dispatch slices per pass (0 = auto). A single dispatch running the
+    /// full 49152-iteration cn1 loop takes multiple seconds on slower GPUs and
+    /// trips the Windows TDR watchdog (~2 s), killing the device. Auto starts
+    /// at 16 slices and doubles whenever a slice exceeds ~200 ms.
+    #[arg(long, default_value_t = 0)]
+    pub cn1_slices: u32,
 
     /// Wavefront size for the cooperative kernels (cn1/cn2): "auto" (wave64 on
     /// AMD, so each cooperative workgroup is a single wave and the barriers are

@@ -2,21 +2,23 @@
 //! reports the first stage that diverges from the CPU reference. Any FP or bit
 //! divergence changes the final hash completely, so matching proves exactness.
 
+use crate::autotune::Crdiv;
 use crate::cnhash;
 use crate::miner::{Miner, MEMORY};
 use crate::vk::Gpu;
 use anyhow::Result;
 use std::sync::Arc;
 
-pub fn run(gpu: Arc<Gpu>, lanes: usize, wave: Option<u32>) -> Result<()> {
+pub fn run(gpu: Arc<Gpu>, lanes: usize, wave: Option<u32>, crdiv: Crdiv) -> Result<()> {
     let tps = 64u32;
     let name = gpu.pdev.name.clone();
     log::info!(
-        "running self-test on {name} (tps={tps}, wave={})",
+        "running self-test on {name} (tps={tps}, wave={}, divide={})",
         wave.map_or_else(|| "driver".to_string(), |w| w.to_string()),
+        crdiv.name(),
     );
 
-    let mut miner = Miner::new(gpu, tps, 1, true, wave)?;
+    let mut miner = Miner::new(gpu, tps, 1, true, wave, 0, crdiv)?;
 
     let mut input = [0u8; 128];
     for i in 0..76 {

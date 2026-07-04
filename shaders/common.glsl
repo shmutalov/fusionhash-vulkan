@@ -131,32 +131,44 @@ vec4 crdiv(vec4 a, vec4 b) {
     // Hardware reciprocal seed (<=2.5 ULP) + one Newton-Raphson step. From a
     // ~22-bit seed one step reaches the fp32 rounding floor, matching the 8-bit
     // seed's three-step result.
+    //
+    // The Newton/Markstein chain is `precise`: SPIR-V only guarantees fma() is
+    // actually fused when it carries NoContraction. Without it, Mesa/ACO on
+    // GCN legally lowers fma to v_mad_f32 (double rounding), the residual
+    // correction picks the wrong neighbour ~half the time, and the quotient is
+    // off by 1 ULP (observed on RADV/Polaris). The seed division itself stays
+    // relaxed so the driver may use its cheap rcp path.
     vec4 y = vec4(1.0) / ab;
-    vec4 e = fma(-ab, y, vec4(1.0)); y = fma(y, e, y);
+    precise vec4 e = fma(-ab, y, vec4(1.0));
+    precise vec4 y1 = fma(y, e, y);
     // Apply the divisor's sign: rb = 1/b.
-    vec4 rb = uintBitsToFloat(floatBitsToUint(y) | (floatBitsToUint(b) & uvec4(0x80000000u)));
+    vec4 rb = uintBitsToFloat(floatBitsToUint(y1) | (floatBitsToUint(b) & uvec4(0x80000000u)));
     // Quotient + FMA residual correction -> correctly rounded a/b.
-    vec4 q = a * rb;
-    vec4 r = fma(-b, q, a);
-    q = fma(r, rb, q);
-    return q;
+    precise vec4 q = a * rb;
+    precise vec4 r = fma(-b, q, a);
+    precise vec4 q1 = fma(r, rb, q);
+    return q1;
 }
 #else
 vec4 crdiv(vec4 a, vec4 b) {
     vec4 ab = abs(b);
     // Reciprocal seed (bit hack) + Newton-Raphson to ~correctly-rounded 1/|b|.
-    vec4 y = uintBitsToFloat(uvec4(0x7EF127EAu) - floatBitsToUint(ab));
-    vec4 e;
-    e = fma(-ab, y, vec4(1.0)); y = fma(y, e, y);
-    e = fma(-ab, y, vec4(1.0)); y = fma(y, e, y);
-    e = fma(-ab, y, vec4(1.0)); y = fma(y, e, y);
+    // `precise` for the same reason as the rcp variant: the fma()s must be
+    // truly fused or the Markstein correction breaks (see above).
+    vec4 y0 = uintBitsToFloat(uvec4(0x7EF127EAu) - floatBitsToUint(ab));
+    precise vec4 e0 = fma(-ab, y0, vec4(1.0));
+    precise vec4 y1 = fma(y0, e0, y0);
+    precise vec4 e1 = fma(-ab, y1, vec4(1.0));
+    precise vec4 y2 = fma(y1, e1, y1);
+    precise vec4 e2 = fma(-ab, y2, vec4(1.0));
+    precise vec4 y3 = fma(y2, e2, y2);
     // Apply the divisor's sign: rb = 1/b.
-    vec4 rb = uintBitsToFloat(floatBitsToUint(y) | (floatBitsToUint(b) & uvec4(0x80000000u)));
+    vec4 rb = uintBitsToFloat(floatBitsToUint(y3) | (floatBitsToUint(b) & uvec4(0x80000000u)));
     // Quotient + FMA residual correction -> correctly rounded a/b.
-    vec4 q = a * rb;
-    vec4 r = fma(-b, q, a);
-    q = fma(r, rb, q);
-    return q;
+    precise vec4 q = a * rb;
+    precise vec4 r = fma(-b, q, a);
+    precise vec4 q1 = fma(r, rb, q);
+    return q1;
 }
 #endif
 
