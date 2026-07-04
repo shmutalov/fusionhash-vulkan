@@ -1,6 +1,6 @@
 [package]
 name = "fusionhash-vulkan"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "FusionHash (CryptoNight-GPU) miner with a Vulkan compute backend, tuned for AMD RDNA3 (RX 7900 XT)"
