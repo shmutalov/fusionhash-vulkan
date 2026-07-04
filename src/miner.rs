@@ -17,12 +17,32 @@ pub const MEMORY: u64 = 2 * 1024 * 1024;
 const STATE_BYTES: u64 = 200; // 25 * u64
 const OUTPUT_LEN: u64 = 256; // uints; [255] = count
 
+/// Total cn1 iterations per hash; the per-slice `iter_count`s must sum to this
+/// (mirrors `ITERATIONS` in cn1.comp).
+const CN1_ITERATIONS: u32 = 49152;
+/// Per-hash slice-resume slot in the cn1 save buffer (vec4 vs + uint s, padded
+/// to 32 B; mirrors `SaveSlot` in cn1.comp).
+const CN1_SAVE_BYTES: u64 = 32;
+/// Auto mode: starting slice count, and the per-slice GPU time above which the
+/// count is doubled. Windows TDR resets the GPU when a dispatch cannot be
+/// preempted for ~2 s, so slices must stay well under that on slow cards.
+const CN1_AUTO_SLICES: u32 = 16;
+const CN1_MAX_SLICES: u32 = 512;
+const CN1_TARGET_SLICE_MS: f64 = 200.0;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Cn0Push {
     nonce_base: u64,
     num_threads: u32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Cn1Push {
+    iter_start: u32,
+    iter_count: u32,
 }
 
 #[repr(C)]
@@ -114,6 +134,7 @@ struct Shard {
     scratch: Buffer,
     states: Buffer,
     output: Buffer,
+    cn1_save: Buffer,
     ds_cn0: vk::DescriptorSet,
     ds_cn00: vk::DescriptorSet,
     ds_cn1: vk::DescriptorSet,
@@ -133,8 +154,16 @@ pub struct Miner {
     cn2: Pipe,
     desc_pool: vk::DescriptorPool,
     cmd_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
+    /// One command buffer per queue submission (grown on demand): cn1 slices
+    /// are submitted individually so no single kernel-driver job outlives the
+    /// GPU watchdog (amdgpu's job timeout covers a whole submission; Windows
+    /// TDR preempts at dispatch boundaries — per-slice submits satisfy both).
+    cmds: Vec<vk::CommandBuffer>,
     fence: vk::Fence,
+    /// cn1 dispatch slices per pass (see `CN1_AUTO_SLICES`).
+    cn1_slices: u32,
+    /// Auto mode: double `cn1_slices` when a slice runs too long.
+    cn1_slices_auto: bool,
     #[allow(dead_code)]
     debug: bool,
     cn2_dbg: Option<Pipe>,
@@ -159,16 +188,24 @@ impl Miner {
         num_shards: u32,
         debug: bool,
         wave: Option<u32>,
+        cn1_slices: u32,
     ) -> Result<Self> {
         assert!(tps % 64 == 0, "threads-per-shard must be a multiple of 64");
         let device = gpu.device.clone();
+
+        let cn1_slices_auto = cn1_slices == 0;
+        let cn1_slices = if cn1_slices_auto {
+            CN1_AUTO_SLICES
+        } else {
+            cn1_slices.clamp(1, CN1_MAX_SLICES)
+        };
 
         // Only the cross-lane cooperative kernels (cn1/cn2) benefit from a pinned
         // wavefront; cn0/cn00 have no in-loop barriers, so leave them at the
         // driver default to avoid constraining their occupancy.
         let cn0 = Pipe::new(&gpu, SPV_CN0, 2, std::mem::size_of::<Cn0Push>() as u32, None)?;
         let cn00 = Pipe::new(&gpu, SPV_CN00, 2, 0, None)?;
-        let cn1 = Pipe::new(&gpu, SPV_CN1, 2, 0, wave)?;
+        let cn1 = Pipe::new(&gpu, SPV_CN1, 3, std::mem::size_of::<Cn1Push>() as u32, wave)?;
         let cn2 = Pipe::new(&gpu, SPV_CN2, 3, std::mem::size_of::<Cn2Push>() as u32, wave)?;
         let cn2_dbg = if debug {
             Some(Pipe::new(&gpu, SPV_CN2_DBG, 4, std::mem::size_of::<Cn2Push>() as u32, wave)?)
@@ -178,7 +215,7 @@ impl Miner {
 
         // Descriptor pool sized for all shards.
         let sets_per_shard = if debug { 5 } else { 4 };
-        let bufs_per_shard = if debug { 9 + 4 } else { 9 };
+        let bufs_per_shard = if debug { 10 + 4 } else { 10 };
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(bufs_per_shard * num_shards)];
@@ -209,6 +246,11 @@ impl Miner {
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 true,
             )?;
+            let cn1_save = gpu.create_buffer(
+                CN1_SAVE_BYTES * tps as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                false,
+            )?;
 
             let alloc = |layout: vk::DescriptorSetLayout| -> Result<vk::DescriptorSet> {
                 let layouts = [layout];
@@ -238,6 +280,7 @@ impl Miner {
             write(ds_cn00, 1, &states);
             write(ds_cn1, 0, &scratch);
             write(ds_cn1, 1, &states);
+            write(ds_cn1, 2, &cn1_save);
             write(ds_cn2, 0, &scratch);
             write(ds_cn2, 1, &states);
             write(ds_cn2, 2, &output);
@@ -259,6 +302,7 @@ impl Miner {
                     scratch,
                     states,
                     output,
+                    cn1_save,
                     ds_cn0,
                     ds_cn00,
                     ds_cn1,
@@ -272,6 +316,7 @@ impl Miner {
                 scratch,
                 states,
                 output,
+                cn1_save,
                 ds_cn0,
                 ds_cn00,
                 ds_cn1,
@@ -284,11 +329,6 @@ impl Miner {
             .queue_family_index(gpu.queue_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let cmd_pool = unsafe { device.create_command_pool(&cmd_pool_ci, None) }?;
-        let cb_ai = vk::CommandBufferAllocateInfo::default()
-            .command_pool(cmd_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd = unsafe { device.allocate_command_buffers(&cb_ai) }?[0];
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
 
         Ok(Self {
@@ -303,8 +343,10 @@ impl Miner {
             cn2,
             desc_pool,
             cmd_pool,
-            cmd,
+            cmds: Vec::new(),
             fence,
+            cn1_slices,
+            cn1_slices_auto,
             debug,
             cn2_dbg,
             dbg_bufs,
@@ -316,9 +358,27 @@ impl Miner {
         self.tps as u64 * self.num_shards as u64
     }
 
+    /// Current cn1 slice count (may grow in auto mode).
+    pub fn cn1_slices(&self) -> u32 {
+        self.cn1_slices
+    }
+
     /// Upload the 128-byte input blob (with the 0x01 pad already applied).
     pub fn set_input(&self, input: &[u8; 128]) {
         unsafe { self.input.write_bytes(0, input) };
+    }
+
+    /// Grow the command-buffer pool to at least `n` buffers.
+    fn ensure_cmds(&mut self, n: usize) -> Result<()> {
+        if self.cmds.len() < n {
+            let ai = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count((n - self.cmds.len()) as u32);
+            let mut fresh = unsafe { self.gpu.device.allocate_command_buffers(&ai) }?;
+            self.cmds.append(&mut fresh);
+        }
+        Ok(())
     }
 
     fn barrier(&self, cmd: vk::CommandBuffer) {
@@ -359,112 +419,162 @@ impl Miner {
             }
         }
 
-        // Record the command buffer (stage-major so shards overlap).
+        // One command buffer per queue submission: cn0/cn00 ride with the
+        // first cn1 slice, cn2 with the last (stage-major within each buffer
+        // so shards overlap). Each cn1 slice is submitted as its own job so
+        // no single submission outlives the OS GPU watchdog — Windows TDR
+        // (~2 s) preempts at dispatch boundaries, but amdgpu's job timeout
+        // covers a whole submission, so slicing inside one submit is not
+        // enough on Linux.
+        let slices = if stages >= 3 {
+            self.cn1_slices.clamp(1, CN1_ITERATIONS)
+        } else {
+            1
+        };
+        let base_count = CN1_ITERATIONS / slices;
+        let extra = CN1_ITERATIONS % slices; // first `extra` slices run one more
+        let num_cmds = slices as usize;
+        self.ensure_cmds(num_cmds)?;
+
         unsafe {
-            device.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())?;
             let bi = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            device.begin_command_buffer(self.cmd, &bi)?;
+            let mut start = 0u32;
+            for ci in 0..num_cmds {
+                let cmd = self.cmds[ci];
+                device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+                device.begin_command_buffer(cmd, &bi)?;
 
-            // Stage cn0
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.cn0.pipeline);
-            for shard in &self.shards {
-                device.cmd_bind_descriptor_sets(
-                    self.cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.cn0.layout,
-                    0,
-                    &[shard.ds_cn0],
-                    &[],
-                );
-                let push = Cn0Push {
-                    nonce_base: shard.nonce_base,
-                    num_threads: self.tps,
-                    _pad: 0,
+                if ci == 0 {
+                    // Stage cn0
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.cn0.pipeline);
+                    for shard in &self.shards {
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.cn0.layout,
+                            0,
+                            &[shard.ds_cn0],
+                            &[],
+                        );
+                        let push = Cn0Push {
+                            nonce_base: shard.nonce_base,
+                            num_threads: self.tps,
+                            _pad: 0,
+                        };
+                        device.cmd_push_constants(
+                            cmd,
+                            self.cn0.layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            as_bytes(&push),
+                        );
+                        device.cmd_dispatch(cmd, self.tps / 64, 1, 1);
+                    }
+
+                    if stages >= 2 {
+                        self.barrier(cmd);
+
+                        // Stage cn00
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.cn00.pipeline,
+                        );
+                        for shard in &self.shards {
+                            device.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                self.cn00.layout,
+                                0,
+                                &[shard.ds_cn00],
+                                &[],
+                            );
+                            device.cmd_dispatch(cmd, self.tps, 1, 1);
+                        }
+                    }
+                }
+
+                if stages >= 3 {
+                    // Make the previous stage/slice's writes visible (pipeline
+                    // barriers order across submissions on the same queue).
+                    self.barrier(cmd);
+
+                    // Stage cn1, slice `ci`. Slice N+1 reads the scratchpad and
+                    // save-state written by slice N; shards overlap in a slice.
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.cn1.pipeline);
+                    let count = base_count + u32::from((ci as u32) < extra);
+                    let push = Cn1Push {
+                        iter_start: start,
+                        iter_count: count,
+                    };
+                    device.cmd_push_constants(
+                        cmd,
+                        self.cn1.layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        as_bytes(&push),
+                    );
+                    for shard in &self.shards {
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.cn1.layout,
+                            0,
+                            &[shard.ds_cn1],
+                            &[],
+                        );
+                        device.cmd_dispatch(cmd, self.tps / 4, 1, 1);
+                    }
+                    start += count;
+                }
+
+                if stages >= 4 && ci == num_cmds - 1 {
+                    self.barrier(cmd);
+
+                    // Stage cn2
+                    let (cn2_pipe, cn2_layout) = match &self.cn2_dbg {
+                        Some(p) => (p.pipeline, p.layout),
+                        None => (self.cn2.pipeline, self.cn2.layout),
+                    };
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, cn2_pipe);
+                    for shard in &self.shards {
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            cn2_layout,
+                            0,
+                            &[shard.ds_cn2],
+                            &[],
+                        );
+                        let push = Cn2Push { target };
+                        device.cmd_push_constants(
+                            cmd,
+                            cn2_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            as_bytes(&push),
+                        );
+                        device.cmd_dispatch(cmd, 1, self.tps / 8, 1);
+                    }
+                }
+
+                device.end_command_buffer(cmd)?;
+            }
+
+            let pass_start = std::time::Instant::now();
+            for ci in 0..num_cmds {
+                let cbs = [self.cmds[ci]];
+                let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+                let fence = if ci == num_cmds - 1 {
+                    self.fence
+                } else {
+                    vk::Fence::null()
                 };
-                device.cmd_push_constants(
-                    self.cmd,
-                    self.cn0.layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    as_bytes(&push),
-                );
-                device.cmd_dispatch(self.cmd, self.tps / 64, 1, 1);
+                device
+                    .queue_submit(self.gpu.queue, &[submit], fence)
+                    .context("queue_submit failed")?;
             }
-
-            if stages >= 2 {
-            self.barrier(self.cmd);
-
-            // Stage cn00
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.cn00.pipeline);
-            for shard in &self.shards {
-                device.cmd_bind_descriptor_sets(
-                    self.cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.cn00.layout,
-                    0,
-                    &[shard.ds_cn00],
-                    &[],
-                );
-                device.cmd_dispatch(self.cmd, self.tps, 1, 1);
-            }
-            }
-
-            if stages >= 3 {
-            self.barrier(self.cmd);
-
-            // Stage cn1
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.cn1.pipeline);
-            for shard in &self.shards {
-                device.cmd_bind_descriptor_sets(
-                    self.cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.cn1.layout,
-                    0,
-                    &[shard.ds_cn1],
-                    &[],
-                );
-                device.cmd_dispatch(self.cmd, self.tps / 4, 1, 1);
-            }
-            }
-
-            if stages >= 4 {
-            self.barrier(self.cmd);
-
-            // Stage cn2
-            let (cn2_pipe, cn2_layout) = match &self.cn2_dbg {
-                Some(p) => (p.pipeline, p.layout),
-                None => (self.cn2.pipeline, self.cn2.layout),
-            };
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, cn2_pipe);
-            for shard in &self.shards {
-                device.cmd_bind_descriptor_sets(
-                    self.cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    cn2_layout,
-                    0,
-                    &[shard.ds_cn2],
-                    &[],
-                );
-                let push = Cn2Push { target };
-                device.cmd_push_constants(
-                    self.cmd,
-                    cn2_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    as_bytes(&push),
-                );
-                device.cmd_dispatch(self.cmd, 1, self.tps / 8, 1);
-            }
-            }
-
-            device.end_command_buffer(self.cmd)?;
-
-            let cbs = [self.cmd];
-            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-            device
-                .queue_submit(self.gpu.queue, &[submit], self.fence)
-                .context("queue_submit failed")?;
 
             // Wait for the GPU without pegging a CPU core. Some drivers implement
             // an infinite `vkWaitForFences` as a spin loop, which burns a whole
@@ -480,6 +590,24 @@ impl Miner {
                 }
             }
             device.reset_fences(&[self.fence])?;
+
+            // Auto slice sizing: the pass time is an upper bound on the cn1
+            // slice time (cn1 dominates a full pass), so keep doubling while a
+            // slice could exceed the TDR-safe target. Only full passes are
+            // meaningful; partial (self-test) passes skip cn1 entirely or run
+            // it whole, and adapting there is harmless either way.
+            if self.cn1_slices_auto && stages >= 3 {
+                let per_slice_ms =
+                    pass_start.elapsed().as_secs_f64() * 1000.0 / self.cn1_slices as f64;
+                if per_slice_ms > CN1_TARGET_SLICE_MS && self.cn1_slices < CN1_MAX_SLICES {
+                    self.cn1_slices = (self.cn1_slices * 2).min(CN1_MAX_SLICES);
+                    log::info!(
+                        "cn1 slice ~{per_slice_ms:.0} ms > {CN1_TARGET_SLICE_MS:.0} ms; \
+                         raising cn1 slices to {} (GPU watchdog headroom)",
+                        self.cn1_slices
+                    );
+                }
+            }
         }
 
         // Collect flagged candidates.
@@ -554,6 +682,7 @@ impl Drop for Miner {
             self.gpu.destroy_buffer(&s.scratch);
             self.gpu.destroy_buffer(&s.states);
             self.gpu.destroy_buffer(&s.output);
+            self.gpu.destroy_buffer(&s.cn1_save);
         }
         self.gpu.destroy_buffer(&self.input);
     }

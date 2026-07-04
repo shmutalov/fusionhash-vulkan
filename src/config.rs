@@ -54,6 +54,13 @@ pub struct Config {
     #[arg(long, default_value_t = 960)]
     pub tps: u32,
 
+    /// cn1 dispatch slices per pass (0 = auto). A single dispatch running the
+    /// full 49152-iteration cn1 loop takes multiple seconds on slower GPUs and
+    /// trips the Windows TDR watchdog (~2 s), killing the device. Auto starts
+    /// at 16 slices and doubles whenever a slice exceeds ~200 ms.
+    #[arg(long, default_value_t = 0)]
+    pub cn1_slices: u32,
+
     /// Wavefront size for the cooperative kernels (cn1/cn2): "auto" (wave64 on
     /// AMD, so each cooperative workgroup is a single wave and the barriers are
     /// free), "driver" (no pinning), "32", or "64". "32"/"driver" are mainly for

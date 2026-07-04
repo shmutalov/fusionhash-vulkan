@@ -16,7 +16,7 @@ pub fn run(gpu: Arc<Gpu>, lanes: usize, wave: Option<u32>) -> Result<()> {
         wave.map_or_else(|| "driver".to_string(), |w| w.to_string()),
     );
 
-    let mut miner = Miner::new(gpu, tps, 1, true, wave)?;
+    let mut miner = Miner::new(gpu, tps, 1, true, wave, 0)?;
 
     let mut input = [0u8; 128];
     for i in 0..76 {

@@ -56,6 +56,15 @@ holding `--tps` lanes (default 960 ≈ 1.9 GiB). Several shards run per dispatch
 stage-major, so they overlap on the queue. On a 7900 XT the default (intensity 1)
 uses 5 shards / 4800 lanes at ~5.9 kH/s.
 
+The cn1 stage is dispatched in slices (`--cn1-slices`, default auto) rather
+than as one 49152-iteration dispatch: a dispatch that runs for seconds cannot
+be preempted, and Windows' TDR watchdog resets the GPU (`VK_ERROR_DEVICE_LOST`)
+after ~2 s — which is exactly what happens on slower cards (e.g. an RX 580
+needs ~2.5 s per pass). Each hash's tiny resume state (`s` + `vs`, 32 B) is
+persisted between slices, so the split is bit-exact and costs nothing
+measurable (~48 ms/slice on a 7900 XT). Auto starts at 16 slices and doubles
+whenever a slice exceeds ~200 ms.
+
 ## Build
 
 Requires the Vulkan SDK (for `glslc`, which `build.rs` invokes) and Rust ≥ 1.75.
@@ -85,8 +94,8 @@ vulkminer --shards 5 --tps 960
 ```
 
 Flags: `--pool --user --pass`, `--devices/-d`, `--intensity`, `--shards`,
-`--tps`, `--all` (include non-AMD/NVIDIA devices), `--info`, `--mock`,
-`--selftest`, `--microtest`.
+`--tps`, `--cn1-slices`, `--all` (include non-AMD/NVIDIA devices), `--info`,
+`--mock`, `--selftest`, `--microtest`.
 
 ## Pool protocol
 

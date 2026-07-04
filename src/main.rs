@@ -96,10 +96,10 @@ fn main() -> Result<()> {
         let gpu = Gpu::new(instance.clone(), pd.clone())?;
         let num_shards = compute_shards(&cfg, pd);
         let wave = resolve_wave(&gpu, &cfg.wave);
-        let miner = Miner::new(gpu, cfg.tps, num_shards, false, wave)?;
+        let miner = Miner::new(gpu, cfg.tps, num_shards, false, wave, cfg.cn1_slices)?;
         let total = miner.hashes_per_iter();
         log::info!(
-            "device [{}] {}: tps={} shards={} threads={} scratch={:.2} GiB wave={}",
+            "device [{}] {}: tps={} shards={} threads={} scratch={:.2} GiB wave={} cn1_slices={}{}",
             idx + 1,
             pd.name,
             cfg.tps,
@@ -107,6 +107,8 @@ fn main() -> Result<()> {
             total,
             (MEMORY * total) as f64 / (1u64 << 30) as f64,
             wave.map_or_else(|| "driver".to_string(), |w| w.to_string()),
+            miner.cn1_slices(),
+            if cfg.cn1_slices == 0 { " (auto)" } else { "" },
         );
 
         let hr = Arc::new(AtomicU64::new(0));
