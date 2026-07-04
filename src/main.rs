@@ -1,3 +1,4 @@
+mod autotune;
 mod cnhash;
 mod config;
 mod microtest;
@@ -71,7 +72,8 @@ fn main() -> Result<()> {
     if cfg.selftest {
         let gpu = Gpu::new(instance.clone(), chosen[0].clone())?;
         let wave = resolve_wave(&gpu, &cfg.wave);
-        return selftest::run(gpu, 64, wave);
+        let crdiv = autotune::select_crdiv(&gpu, &cfg.crdiv)?;
+        return selftest::run(gpu, 64, wave, crdiv);
     }
 
     // Pool.
@@ -96,10 +98,11 @@ fn main() -> Result<()> {
         let gpu = Gpu::new(instance.clone(), pd.clone())?;
         let num_shards = compute_shards(&cfg, pd);
         let wave = resolve_wave(&gpu, &cfg.wave);
-        let miner = Miner::new(gpu, cfg.tps, num_shards, false, wave, cfg.cn1_slices)?;
+        let crdiv = autotune::select_crdiv(&gpu, &cfg.crdiv)?;
+        let miner = Miner::new(gpu, cfg.tps, num_shards, false, wave, cfg.cn1_slices, crdiv)?;
         let total = miner.hashes_per_iter();
         log::info!(
-            "device [{}] {}: tps={} shards={} threads={} scratch={:.2} GiB wave={} cn1_slices={}{}",
+            "device [{}] {}: tps={} shards={} threads={} scratch={:.2} GiB wave={} divide={} cn1_slices={}{}",
             idx + 1,
             pd.name,
             cfg.tps,
@@ -107,6 +110,7 @@ fn main() -> Result<()> {
             total,
             (MEMORY * total) as f64 / (1u64 << 30) as f64,
             wave.map_or_else(|| "driver".to_string(), |w| w.to_string()),
+            crdiv.name(),
             miner.cn1_slices(),
             if cfg.cn1_slices == 0 { " (auto)" } else { "" },
         );

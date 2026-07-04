@@ -2,6 +2,7 @@
 //! / state / output buffers, and drives one full cn/gpu pipeline pass per
 //! iteration.
 
+use crate::autotune::Crdiv;
 use crate::vk::{as_bytes, Buffer, Gpu};
 use anyhow::{Context, Result};
 use ash::vk;
@@ -9,7 +10,6 @@ use std::sync::Arc;
 
 const SPV_CN0: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cn0.comp.spv"));
 const SPV_CN00: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cn00.comp.spv"));
-const SPV_CN1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cn1.comp.spv"));
 const SPV_CN2: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cn2.comp.spv"));
 const SPV_CN2_DBG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cn2_dbg.comp.spv"));
 
@@ -189,6 +189,7 @@ impl Miner {
         debug: bool,
         wave: Option<u32>,
         cn1_slices: u32,
+        crdiv: Crdiv,
     ) -> Result<Self> {
         assert!(tps % 64 == 0, "threads-per-shard must be a multiple of 64");
         let device = gpu.device.clone();
@@ -205,7 +206,13 @@ impl Miner {
         // driver default to avoid constraining their occupancy.
         let cn0 = Pipe::new(&gpu, SPV_CN0, 2, std::mem::size_of::<Cn0Push>() as u32, None)?;
         let cn00 = Pipe::new(&gpu, SPV_CN00, 2, 0, None)?;
-        let cn1 = Pipe::new(&gpu, SPV_CN1, 3, std::mem::size_of::<Cn1Push>() as u32, wave)?;
+        let cn1 = Pipe::new(
+            &gpu,
+            crdiv.cn1_spv(),
+            3,
+            std::mem::size_of::<Cn1Push>() as u32,
+            wave,
+        )?;
         let cn2 = Pipe::new(&gpu, SPV_CN2, 3, std::mem::size_of::<Cn2Push>() as u32, wave)?;
         let cn2_dbg = if debug {
             Some(Pipe::new(&gpu, SPV_CN2_DBG, 4, std::mem::size_of::<Cn2Push>() as u32, wave)?)

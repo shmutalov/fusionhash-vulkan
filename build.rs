@@ -2,20 +2,35 @@
 //! (from the Vulkan SDK). When `glslc` is not available (e.g. a minimal Linux
 //! rig or CI image), it falls back to the pre-built SPIR-V committed under
 //! `shaders/spirv/`, so the crate builds with nothing but a Rust toolchain.
+//!
+//! The FP-core kernels (cn1 / sctest) are built once per correctly-rounded
+//! divide variant; every variant is embedded in the binary and the right one
+//! is selected per device at runtime (see `src/autotune.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// (source shader, output basename)
+// (source shader, output basename) — kernels with a single build.
 const SHADERS: &[(&str, &str)] = &[
     ("cn0.comp", "cn0.comp.spv"),
     ("cn00.comp", "cn00.comp.spv"),
-    ("cn1.comp", "cn1.comp.spv"),
     ("cn2.comp", "cn2.comp.spv"),
-    ("sctest.comp", "sctest.comp.spv"),
 ];
 // cn2 debug variant (defines DEBUG_HASH)
 const CN2_DBG_OUT: &str = "cn2_dbg.comp.spv";
+
+// FP-core kernels × divide variants:
+//   rcp       — hardware reciprocal seed + 1 Newton step (fastest)
+//   markstein — bit-hack integer seed + 3 Newton steps (driver-independent seed)
+//   fp64      — divide in fp64 and round back (needs shaderFloat64; the only
+//               bit-exact option on drivers that do not fuse fp32 fma, e.g.
+//               Mesa/ACO on GCN)
+const CRDIV_SHADERS: &[&str] = &["cn1", "sctest"];
+const CRDIV_VARIANTS: &[(&str, Option<&str>)] = &[
+    ("rcp", Some("CRDIV_RCP")),
+    ("markstein", None),
+    ("fp64", Some("CRDIV_FP64")),
+];
 
 fn find_glslc() -> Option<PathBuf> {
     if let Ok(sdk) = std::env::var("VULKAN_SDK") {
@@ -42,22 +57,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
-    println!("cargo:rerun-if-env-changed=CRDIV");
-
-    // Correctly-rounded fp32 divide variant for the cn/gpu core (cn1 / sctest):
-    //   (unset)/rcp -> hardware reciprocal seed + 1 Newton step (default)
-    //   markstein   -> bit-hack seed + 3 Newton steps (driver-independent seed)
-    //   fp64        -> divide in fp64 and round back
-    let crdiv_env = std::env::var("CRDIV").ok();
-    let crdiv: Vec<&str> = match crdiv_env.as_deref() {
-        Some("markstein") => vec![],
-        Some("fp64") => vec!["CRDIV_FP64"],
-        _ => vec!["CRDIV_RCP"],
-    };
-    // The committed prebuilt SPIR-V is built with the default (rcp), so only a
-    // non-default override needs glslc; the default falls back cleanly (e.g. CI
-    // runners without a Vulkan SDK).
-    let needs_glslc = matches!(crdiv_env.as_deref(), Some("markstein") | Some("fp64"));
 
     let glslc = find_glslc();
 
@@ -98,23 +97,23 @@ fn main() {
 
     for (src_name, out_name) in SHADERS {
         let dst = out_dir.join(out_name);
-        // Only the FP-core shaders divide; the CRDIV define is inert elsewhere.
-        let defines: &[&str] = if matches!(*src_name, "cn1.comp" | "sctest.comp") {
-            &crdiv
-        } else {
-            &[]
-        };
-        if !compile(&shader_dir.join(src_name), &dst, defines) {
-            if needs_glslc {
-                panic!(
-                    "CRDIV={:?} overrides the default divide but glslc (Vulkan SDK) \
-                     is unavailable to recompile the shaders",
-                    crdiv
-                );
-            }
+        if !compile(&shader_dir.join(src_name), &dst, &[]) {
             use_prebuilt(out_name, &dst);
         }
     }
+
+    for base in CRDIV_SHADERS {
+        let src = shader_dir.join(format!("{base}.comp"));
+        for (variant, define) in CRDIV_VARIANTS {
+            let out_name = format!("{base}_{variant}.comp.spv");
+            let dst = out_dir.join(&out_name);
+            let defines: Vec<&str> = define.iter().copied().collect();
+            if !compile(&src, &dst, &defines) {
+                use_prebuilt(&out_name, &dst);
+            }
+        }
+    }
+
     let dbg_dst = out_dir.join(CN2_DBG_OUT);
     if !compile(&shader_dir.join("cn2.comp"), &dbg_dst, &["DEBUG_HASH"]) {
         use_prebuilt(CN2_DBG_OUT, &dbg_dst);

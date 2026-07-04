@@ -54,6 +54,13 @@ pub struct Config {
     #[arg(long, default_value_t = 960)]
     pub tps: u32,
 
+    /// Correctly-rounded divide variant for the FP core: "auto" (validate each
+    /// variant on the device at startup and keep the fastest bit-exact one),
+    /// "rcp", "markstein" or "fp64". Forced variants are still validated —
+    /// a diverging divide can never produce an accepted share.
+    #[arg(long, default_value = "auto")]
+    pub crdiv: String,
+
     /// cn1 dispatch slices per pass (0 = auto). A single dispatch running the
     /// full 49152-iteration cn1 loop takes multiple seconds on slower GPUs and
     /// trips the Windows TDR watchdog (~2 s), killing the device. Auto starts

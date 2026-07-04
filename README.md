@@ -110,21 +110,28 @@ mis-mapped target cannot produce a rejected share, only a missed one.
 * `--tps` is capped by the 2 GiB max-allocation limit (960 lanes ≈ 1.9 GiB).
 * More shards is not always faster: the card saturates around 3–5 shards and then
   becomes power/thermal-bound (8 shards is slower than 5).
-* The correctly-rounded fp32 divide has three variants, selected at build time
-  with the `CRDIV` env var (all bit-exact — verified by `--microtest` /
-  `--selftest`):
-  * `CRDIV=rcp` (default) — seed the reciprocal from the hardware divide
-    (`1.0/|b|`, one `v_rcp`, ≤2.5 ULP) and do a single Newton step. One step from
-    a ~22-bit seed reaches the same fp32 rounding floor the bit-hack needs three
-    for, so the Markstein residual correction still pins the correctly-rounded
-    quotient on any conformant driver. ~4 fewer FMAs and it offloads the seed onto
-    the transcendental unit; measured **+2.4 % on a 7900 XT** (larger gains
-    expected where the FP32 ALU is the bottleneck, i.e. RDNA1/2).
-  * `CRDIV=markstein` — bit-hack reciprocal seed + 3 Newton steps. The seed is
+* The correctly-rounded fp32 divide has three variants; **all are embedded in
+  the binary and the right one is picked per device at startup**
+  ([`src/autotune.rs`](src/autotune.rs)): each candidate is validated
+  bit-for-bit against the CPU reference over 16k `single_compute` records
+  (~100 ms) and the fastest exact one wins. `--crdiv rcp|markstein|fp64`
+  forces a variant (still validated — a diverging divide can never produce an
+  accepted share); `--microtest` reports the status of all three on a device.
+  * `rcp` — seed the reciprocal from the hardware divide (`1.0/|b|`, one
+    `v_rcp`, ≤2.5 ULP) and do a single Newton step; the Markstein residual
+    correction pins the correctly-rounded quotient. Measured **+2.4 % on a
+    7900 XT**; the auto-selection default everywhere it validates.
+  * `markstein` — bit-hack reciprocal seed + 3 Newton steps. The seed is
     driver-independent (a pure integer op), so it needs no guarantees from the
-    driver's `OpFDiv` — the conservative fallback if a driver's divide misbehaves.
-  * `CRDIV=fp64` — divide in fp64 and round back; ~9 % slower on RDNA3 and far
-    slower on cards with 1/16-rate fp64 (RDNA1/2). Reference/fallback only.
+    driver's `OpFDiv` lowering.
+  * `fp64` — divide in fp64 and round back. Slow (1/16-rate fp64 on GCN) but
+    the only variant that does not require the driver to emit *fused* fp32
+    fmas. This matters in practice: **Mesa/ACO on GCN (e.g. RADV on an
+    RX 570/580) never fuses `fma()`** — neither `precise` nor a
+    `NoContraction` decoration changes that — which silently breaks both fp32
+    variants by 1 ULP on ~44 % of divides. Auto-selection lands here on
+    those drivers (measured ~0.45 kH/s vs ~0.7 fp32-theoretical on an
+    RX 570).
 * Cooperative-kernel wavefront size is pinned with `--wave auto|driver|32|64`
   (`auto` = wave64 on AMD, so each cn1/cn2 workgroup is a single wave and its
   barriers are free). On a 7900 XT `auto` matches the driver default; `32` is for
