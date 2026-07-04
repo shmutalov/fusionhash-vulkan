@@ -100,7 +100,17 @@ fn main() -> Result<()> {
         let wave = resolve_wave(&gpu, &cfg.wave);
         let crdiv = autotune::select_crdiv(&gpu, &cfg.crdiv)?;
         let num_shards = if cfg.tune && cfg.shards == 0 {
-            autotune::tune_shards(&gpu, &cfg, tps, formula_shards, wave, crdiv)?
+            let shards = autotune::tune_shards(&gpu, &cfg, tps, formula_shards, wave, crdiv)?;
+            log::info!(
+                "device [{}] {}: tuned — to skip auto-tuning next time, run with: \
+                 --tune=false --tps {} --shards {} --crdiv {}",
+                idx + 1,
+                pd.name,
+                tps,
+                shards,
+                crdiv.name(),
+            );
+            shards
         } else {
             formula_shards
         };
