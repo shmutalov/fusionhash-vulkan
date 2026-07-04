@@ -87,7 +87,7 @@ fn main() -> Result<()> {
     // Spin up a miner thread per device.
     let mut reporters: Vec<Reporter> = Vec::new();
     for (idx, pd) in chosen.iter().enumerate() {
-        let (tps, num_shards) = autotune::select_layout(&cfg, pd);
+        let (tps, formula_shards) = autotune::select_layout(&cfg, pd);
         if MEMORY * tps as u64 > pd.max_alloc {
             bail!(
                 "tps={} needs {} MiB/shard which exceeds the device max allocation of {} MiB; lower --tps",
@@ -99,6 +99,11 @@ fn main() -> Result<()> {
         let gpu = Gpu::new(instance.clone(), pd.clone())?;
         let wave = resolve_wave(&gpu, &cfg.wave);
         let crdiv = autotune::select_crdiv(&gpu, &cfg.crdiv)?;
+        let num_shards = if cfg.tune && cfg.shards == 0 {
+            autotune::tune_shards(&gpu, &cfg, tps, formula_shards, wave, crdiv)?
+        } else {
+            formula_shards
+        };
         let miner = Miner::new(gpu, tps, num_shards, false, wave, cfg.cn1_slices, crdiv)?;
         let total = miner.hashes_per_iter();
         log::info!(

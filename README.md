@@ -94,7 +94,9 @@ vulkminer --shards 5 --tps 960
 ```
 
 Flags: `--pool --user --pass`, `--devices/-d`, `--intensity`, `--shards`,
-`--tps`, `--cn1-slices`, `--all` (include non-AMD/NVIDIA devices), `--info`,
+`--tps`, `--tune` (default true: measure shard candidates at startup, cached
+per device in `~/.vulkminer-tune.json`; `--tune=false` uses the formula only),
+`--crdiv`, `--cn1-slices`, `--all` (include non-AMD/NVIDIA devices), `--info`,
 `--mock`, `--selftest`, `--microtest`.
 
 ## Pool protocol

@@ -56,6 +56,15 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub tps: u32,
 
+    /// Measure candidate shard counts at startup (one warm-up + 2 timed full
+    /// passes each, hill-climbing from the computed target) and keep the
+    /// fastest. Results are cached per device/driver/version/config in
+    /// ~/.vulkminer-tune.json, so only the first launch pays the sweep.
+    /// Disable with --tune=false; a forced --shards also skips it.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+          num_args = 0..=1, default_missing_value = "true")]
+    pub tune: bool,
+
     /// Correctly-rounded divide variant for the FP core: "auto" (validate each
     /// variant on the device at startup and keep the fastest bit-exact one),
     /// "rcp", "markstein" or "fp64". Forced variants are still validated —

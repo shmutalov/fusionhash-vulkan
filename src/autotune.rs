@@ -11,9 +11,10 @@
 
 use crate::config::Config;
 use crate::microtest;
-use crate::miner::MEMORY;
+use crate::miner::{Miner, MEMORY};
 use crate::vk::{Gpu, PhysicalDevice};
 use anyhow::{bail, Result};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Correctly-rounded fp32 divide implementations, fastest first.
@@ -141,6 +142,175 @@ pub fn select_layout(cfg: &Config, pd: &PhysicalDevice) -> (u32, u32) {
         }
     }
     best
+}
+
+/// One warm-up plus this many timed full passes per shard-count candidate.
+const TUNE_PASSES: u32 = 2;
+
+/// A tuned result, keyed by everything that would invalidate it.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+struct TuneKey {
+    device: String,
+    device_id: u32,
+    driver: String,
+    version: String,
+    crdiv: String,
+    tps: u32,
+    intensity: f64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct TuneEntry {
+    key: TuneKey,
+    shards: u32,
+    khs: f64,
+}
+
+fn tune_cache_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".vulkminer-tune.json")
+}
+
+fn load_tune_cache() -> Vec<TuneEntry> {
+    std::fs::read_to_string(tune_cache_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_tune_entry(entry: TuneEntry) {
+    let mut cache = load_tune_cache();
+    cache.retain(|e| e.key != entry.key);
+    cache.push(entry);
+    if let Ok(s) = serde_json::to_string_pretty(&cache) {
+        if let Err(e) = std::fs::write(tune_cache_path(), s) {
+            log::warn!("could not write {}: {e}", tune_cache_path().display());
+        }
+    }
+}
+
+/// Time `TUNE_PASSES` full pipeline passes for one layout; returns kH/s.
+/// The miner (and its scratchpads) is dropped before the next candidate runs.
+fn measure_layout(
+    gpu: &Arc<Gpu>,
+    tps: u32,
+    shards: u32,
+    wave: Option<u32>,
+    cn1_slices: u32,
+    crdiv: Crdiv,
+) -> Result<f64> {
+    let mut miner = Miner::new(gpu.clone(), tps, shards, false, wave, cn1_slices, crdiv)?;
+    let mut input = [0u8; 128];
+    for (i, b) in input.iter_mut().enumerate().take(76) {
+        *b = ((i * 11 + 5) & 0xff) as u8;
+    }
+    input[76] = 0x01;
+    miner.set_input(&input);
+    let lanes = miner.hashes_per_iter();
+    miner.run_iteration(0, 0)?; // warm-up (also lets auto cn1 slicing settle)
+    let t = std::time::Instant::now();
+    for p in 0..TUNE_PASSES {
+        miner.run_iteration((p as u64 + 1) * lanes, 0)?;
+    }
+    Ok((lanes * TUNE_PASSES as u64) as f64 / t.elapsed().as_secs_f64() / 1000.0)
+}
+
+/// Measured shard tuning: hill-climb the shard count around the formula's
+/// starting point (`shards0`), one VRAM-budget step at a time, and keep the
+/// fastest. Results are cached per device/driver/version/config so later
+/// startups skip the sweep.
+pub fn tune_shards(
+    gpu: &Arc<Gpu>,
+    cfg: &Config,
+    tps: u32,
+    shards0: u32,
+    wave: Option<u32>,
+    crdiv: Crdiv,
+) -> Result<u32> {
+    let pd = &gpu.pdev;
+    let max_shards = ((pd.device_local_mem as f64 * VRAM_BUDGET
+        / (MEMORY * tps as u64) as f64) as u32)
+        .max(1);
+
+    let key = TuneKey {
+        device: pd.name.clone(),
+        device_id: pd.device_id,
+        driver: pd.driver_info.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        crdiv: crdiv.name().to_string(),
+        tps,
+        intensity: cfg.intensity,
+    };
+    if let Some(e) = load_tune_cache().iter().find(|e| e.key == key) {
+        let shards = e.shards.clamp(1, max_shards);
+        log::info!(
+            "[{}] tuned shards={} ({:.3} kH/s, cached in {})",
+            pd.name,
+            shards,
+            e.khs,
+            tune_cache_path().display()
+        );
+        return Ok(shards);
+    }
+
+    log::info!(
+        "[{}] tuning shard count (start {}, 1..={} possible, {} timed passes each; \
+         --tune=false skips this)",
+        pd.name,
+        shards0,
+        max_shards,
+        TUNE_PASSES
+    );
+
+    let mut results: Vec<(u32, f64)> = Vec::new();
+    let mut measured = |n: u32, results: &mut Vec<(u32, f64)>| -> Result<f64> {
+        if let Some(&(_, khs)) = results.iter().find(|(m, _)| *m == n) {
+            return Ok(khs);
+        }
+        let khs = match measure_layout(gpu, tps, n, wave, cfg.cn1_slices, crdiv) {
+            Ok(k) => k,
+            Err(e) => {
+                // e.g. allocation failure at the VRAM edge — score it out.
+                log::warn!("[{}] shards={n}: measurement failed ({e:#})", pd.name);
+                0.0
+            }
+        };
+        log::info!("[{}]   shards={n}: {khs:.3} kH/s", pd.name);
+        results.push((n, khs));
+        Ok(khs)
+    };
+
+    let start = shards0.clamp(1, max_shards);
+    for n in start.saturating_sub(1).max(1)..=(start + 1).min(max_shards) {
+        measured(n, &mut results)?;
+    }
+    // Hill-climb while the best sits on the edge of the measured range.
+    loop {
+        let &(best, _) = results
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("at least one candidate");
+        let lo = results.iter().map(|&(n, _)| n).min().unwrap();
+        let hi = results.iter().map(|&(n, _)| n).max().unwrap();
+        if best == hi && hi < max_shards {
+            measured(hi + 1, &mut results)?;
+        } else if best == lo && lo > 1 {
+            measured(lo - 1, &mut results)?;
+        } else {
+            break;
+        }
+    }
+
+    let &(best, khs) = results.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+    if khs <= 0.0 {
+        bail!("[{}] every tuning candidate failed", pd.name);
+    }
+    log::info!("[{}] tuned shards={best} ({khs:.3} kH/s) — cached", pd.name);
+    save_tune_entry(TuneEntry { key, shards: best, khs });
+    Ok(best)
 }
 
 /// Records for the startup validation. The observed failure modes are dense
